@@ -3,13 +3,10 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "vercel dev",
-    "deploy": "vercel --prod"
+    "dev": "npx vercel dev",
+    "deploy": "npx vercel --prod"
   },
   "dependencies": {
     "@upstash/redis": "1.39.0"
-  },
-  "devDependencies": {
-    "vercel": "64.1.0"
   }
 }

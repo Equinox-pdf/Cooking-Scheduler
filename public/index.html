@@ -38,10 +38,38 @@
 <noscript>Kitchen Sync needs JavaScript enabled.</noscript>
 
 <script type="text/babel" data-presets="react">
+/* ================================================================
+   KITCHEN SYNC – how this file is organized
+   Everything runs in the browser. Search for a section number (e.g. "8.") to jump to it.
+
+   1. Utilities
+   2. Icons
+   3. Domain constants
+   4. Equipment knowledge
+   5. Recipe model
+   6. Sample recipe sets
+   7. Recipe import (reads text, JSON, web pages, PDFs and photos)
+   8. Talking to the server (accounts + saved events – see the api/ folder)
+   9. Scheduler
+   10. Checking recipes before planning (clarifying questions)
+   11. Exports (CSV, Excel, picture)
+   12. Small reusable UI pieces (buttons, cards, modal)
+   13. Step 1 – Kitchen setup
+   14. Step 2 – Recipes
+   15. Step 3 – Schedule settings
+   16. Step 4 – Master plan (alerts, timeline, checklist)
+   17. Clarifying questions pop-up
+   18. Accounts & saved events
+   19. App – holds all the state and ties the steps together
+
+   How a plan is made: recipes (section 5) are checked (10), then generatePlan() in the
+   Scheduler (9) places every task on a timeline and lists the checklist steps; the
+   Master plan screen (16) draws the timeline and checklist from that result.
+   ================================================================ */
 const { useState, useEffect, useMemo, useRef } = React;
 
 /* ================================================================
-   Utilities
+   1. Utilities
    ================================================================ */
 const uid = () => Math.random().toString(36).slice(2, 9);
 const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
@@ -100,7 +128,7 @@ const LIBS = {
 };
 
 /* ================================================================
-   Icons (lucide-react UMD, graceful fallback)
+   2. Icons
    ================================================================ */
 function Icon({ name, className = 'w-4 h-4', ...rest }) {
   const C = (window.LucideReact || {})[name];
@@ -108,7 +136,7 @@ function Icon({ name, className = 'w-4 h-4', ...rest }) {
 }
 
 /* ================================================================
-   Domain constants
+   3. Domain constants
    ================================================================ */
 const CATEGORIES = ['Main', 'Side', 'Dessert', 'Appetizer', 'Breakfast', 'Bread', 'Sauce', 'Drink', 'Other'];
 const RECIPE_COLORS = ['#ea580c', '#0284c7', '#16a34a', '#9333ea', '#db2777', '#ca8a04', '#0d9488', '#4f46e5', '#dc2626', '#65a30d'];
@@ -150,7 +178,7 @@ const adjDur = (d, from, to) => {
 };
 
 /* ================================================================
-   Equipment knowledge
+   4. Equipment knowledge
    ================================================================ */
 const EQUIP_PATTERNS = [
   [/stand\s*mixer|kitchenaid/i, 'Stand Mixer'],
@@ -194,7 +222,7 @@ const eqCount = (settings, name) => {
 };
 
 /* ================================================================
-   Recipe model
+   5. Recipe model
    ================================================================ */
 const blankRecipe = () => ({
   id: uid(), name: '', category: 'Main',
@@ -222,7 +250,7 @@ const usesBurner = (r) => (r.activeTime > 0 && r.activeOnStove) || (r.passiveWhe
 const chainLen = (r) => r.prepTime + r.waitTime + r.activeTime + r.passiveTime * (isOvenRecipe(r) ? Math.ceil(r.batches / 2) : 1) + r.restTime;
 
 /* ================================================================
-   Sample recipe sets
+   6. Sample recipe sets
    ================================================================ */
 const SAMPLE_SETS = [
   {
@@ -291,7 +319,7 @@ const SAMPLE_SETS = [
 ];
 
 /* ================================================================
-   Recipe import / parsing (text, JSON, schema.org, HTML, PDF, images)
+   7. Recipe import (reads text, JSON, web pages, PDFs and photos)
    ================================================================ */
 const DUR_SRC = String.raw`(\d+(?:[.,]\d+)?(?:\s*(?:-|–|to)\s*\d+(?:[.,]\d+)?)?\s*(?:hours?|hrs?|h|minutes?|mins?|m)\b(?:\s*(?:and\s*)?\d+\s*(?:minutes?|mins?|m)\b)?)`;
 function parseMinutes(str) {
@@ -547,7 +575,7 @@ async function importFile(file, onProgress) {
 }
 
 /* ================================================================
-   Server API (accounts + saved events, in api/ and lib/ on Vercel)
+   8. Talking to the server (accounts + saved events – see the api/ folder)
    ================================================================ */
 const serverAvailable = () => location.protocol.startsWith('http');
 async function api(path, { method = 'GET', body } = {}) {
@@ -570,7 +598,7 @@ async function fetchMe() {
   try { return await api('/api/auth?action=me'); } catch { return SIGNED_OUT; }
 }
 /* ================================================================
-   Scheduler
+   9. Scheduler
    ================================================================ */
 function peakLoad(ivs, s, e) {
   const pts = [];
@@ -960,7 +988,7 @@ function generatePlan(recipesIn, settings) {
 }
 
 /* ================================================================
-   Validation → clarifying questions
+   10. Checking recipes before planning (clarifying questions)
    ================================================================ */
 const REVIEW_Q = {
   name: (r) => ({ q: `What should we call this recipe?`, input: 'text', field: 'name', value: r.name }),
@@ -1020,7 +1048,7 @@ function applyCompromise(recipes, ids, temp) {
 }
 
 /* ================================================================
-   Exports
+   11. Exports (CSV, Excel, picture)
    ================================================================ */
 const csvCell = (v) => { const s = String(v ?? ''); return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s; };
 function planRows(plan) {
@@ -1129,7 +1157,7 @@ function exportPNG(plan) {
 }
 
 /* ================================================================
-   UI primitives
+   12. Small reusable UI pieces (buttons, cards, modal)
    ================================================================ */
 const btn = {
   primary: 'inline-flex items-center justify-center gap-2 rounded-xl bg-orange-600 px-4 py-2.5 text-sm font-semibold text-white shadow-sm hover:bg-orange-700 focus:outline-none focus-visible:ring-2 focus-visible:ring-orange-400 disabled:opacity-50 disabled:cursor-not-allowed transition',
@@ -1185,7 +1213,7 @@ function RecipeBar({ r, className = 'h-2.5' }) {
 }
 
 /* ================================================================
-   Step 1 – Kitchen setup
+   13. Step 1 – Kitchen setup
    ================================================================ */
 function KitchenStep({ settings, setSettings, recipes }) {
   const set = (k) => (v) => setSettings((s) => ({ ...s, [k]: v }));
@@ -1243,157 +1271,8 @@ function KitchenStep({ settings, setSettings, recipes }) {
 }
 
 /* ================================================================
-   Step 2 – Recipes
+   14. Step 2 – Recipes
    ================================================================ */
-/* ================================================================
-   Accounts & saved events
-   ================================================================ */
-function AuthModal({ initialMode = 'signin', onDone, onClose }) {
-  const [mode, setMode] = useState(initialMode);
-  const [email, setEmail] = useState('');
-  const [password, setPassword] = useState('');
-  const [show, setShow] = useState(false);
-  const [error, setError] = useState('');
-  const [busy, setBusy] = useState(false);
-  const signup = mode === 'signup';
-  const submit = async (e) => {
-    e.preventDefault();
-    setError('');
-    if (password.length < 6) { setError('Your password needs at least 6 characters.'); return; }
-    setBusy(true);
-    try {
-      const data = await api(`/api/auth?action=${signup ? 'signup' : 'signin'}`, { method: 'POST', body: { email, password } });
-      onDone(data.user, signup);
-    } catch (err) { setError(err.message); setBusy(false); }
-  };
-  return (
-    <Modal title={signup ? 'Create your account' : 'Sign in'} icon="Users" onClose={onClose}>
-      <div className="mb-4 flex gap-1 rounded-xl bg-stone-100 p-1">
-        {[['signin', 'Sign in'], ['signup', 'Create account']].map(([k, l]) => (
-          <button key={k} type="button" onClick={() => { setMode(k); setError(''); }}
-            className={`flex-1 rounded-lg py-2 text-sm font-semibold transition ${mode === k ? 'bg-white text-stone-900 shadow-sm' : 'text-stone-500 hover:text-stone-800'}`}>{l}</button>
-        ))}
-      </div>
-      <form onSubmit={submit} className="space-y-3">
-        <Field label="Email">
-          <input type="email" required autoComplete="email" autoFocus className={inputCls} value={email} onChange={(e) => setEmail(e.target.value)} placeholder="you@example.com" />
-        </Field>
-        <Field label="Password" hint={signup ? 'At least 6 characters.' : ''}>
-          <div className="relative">
-            <input type={show ? 'text' : 'password'} required minLength={6} autoComplete={signup ? 'new-password' : 'current-password'}
-              className={inputCls + ' pr-16'} value={password} onChange={(e) => setPassword(e.target.value)} />
-            <button type="button" onClick={() => setShow((v) => !v)} className="absolute right-2 top-1/2 -translate-y-1/2 rounded px-2 py-1 text-xs font-semibold text-stone-500 hover:bg-stone-100">{show ? 'Hide' : 'Show'}</button>
-          </div>
-        </Field>
-        {error && <p className="flex items-start gap-2 rounded-lg bg-red-50 px-3 py-2 text-sm text-red-700"><Icon name="AlertTriangle" className="mt-0.5 h-4 w-4 shrink-0" />{error}</p>}
-        <button type="submit" className={btn.primary + ' w-full'} disabled={busy}>
-          {busy && <Icon name="Loader2" className="h-4 w-4 animate-spin" />}{signup ? 'Create account' : 'Sign in'}
-        </button>
-      </form>
-    </Modal>
-  );
-}
-
-function AccountMenu({ me, onSignIn, onEvents, onNew, onSignOut }) {
-  const [open, setOpen] = useState(false);
-  if (!me.accounts) return null;
-  if (!me.user) return <button className={btn.secondary} onClick={onSignIn}><Icon name="Users" />Sign in</button>;
-  const act = (fn) => () => { setOpen(false); fn(); };
-  return (
-    <div className="relative">
-      <button className={btn.secondary + ' !pl-1.5'} onClick={() => setOpen((o) => !o)} aria-expanded={open} aria-label="Account menu">
-        <span className="grid h-7 w-7 place-items-center rounded-full bg-orange-600 text-xs font-bold text-white">{me.user.email[0].toUpperCase()}</span>
-        <span className="hidden max-w-[160px] truncate md:inline">{me.user.email}</span>
-        <Icon name="ChevronDown" className="h-4 w-4 text-stone-400" />
-      </button>
-      {open && <>
-        <div className="fixed inset-0 z-40" onClick={() => setOpen(false)} />
-        <div className="absolute right-0 z-50 mt-2 w-60 rounded-xl border border-stone-200 bg-white p-2 shadow-lg">
-          <div className="truncate px-2 py-1.5 text-sm font-semibold">{me.user.email}</div>
-          <div className="my-1 border-t border-stone-100" />
-          <button className={btn.ghost + ' w-full !justify-start'} onClick={act(onEvents)}><Icon name="CalendarClock" />My events</button>
-          <button className={btn.ghost + ' w-full !justify-start'} onClick={act(onNew)}><Icon name="Plus" />Start a new event</button>
-          <button className={btn.ghost + ' w-full !justify-start'} onClick={act(onSignOut)}><Icon name="ChevronLeft" />Sign out</button>
-        </div>
-      </>}
-    </div>
-  );
-}
-
-function SaveEventModal({ current, suggestedName, recipeCount, hasPlan, onSave, onClose }) {
-  const [name, setName] = useState(current?.name || suggestedName);
-  const [busy, setBusy] = useState(false);
-  const save = async (asNew) => { setBusy(true); const ok = await onSave(name.trim(), asNew); if (!ok) setBusy(false); };
-  return (
-    <Modal title={current ? 'Save event' : 'Save this event'} icon="CalendarClock" onClose={onClose}
-      footer={<>
-        <button className={btn.secondary} onClick={onClose}>Cancel</button>
-        {current && <button className={btn.secondary} disabled={busy || !name.trim()} onClick={() => save(true)}>Save as new event</button>}
-        <button className={btn.primary} disabled={busy || !name.trim()} onClick={() => save(false)}>
-          {busy && <Icon name="Loader2" className="h-4 w-4 animate-spin" />}{current ? 'Save changes' : 'Save event'}
-        </button>
-      </>}>
-      <form onSubmit={(e) => { e.preventDefault(); if (name.trim()) save(false); }}>
-        <Field label="Event name">
-          <input className={inputCls} autoFocus maxLength={80} value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. Thanksgiving 2026" />
-        </Field>
-      </form>
-      <p className="mt-3 text-sm text-stone-600">Saves your {recipeCount} recipe{recipeCount === 1 ? '' : 's'}, kitchen setup, schedule settings{hasPlan ? ', master plan and checklist progress' : ''} to your account, so you can open it on any device.</p>
-    </Modal>
-  );
-}
-
-function EventsModal({ current, onOpen, onNew, onClose, toast }) {
-  const [events, setEvents] = useState(null);
-  const [busyId, setBusyId] = useState(null);
-  useEffect(() => {
-    api('/api/events').then((d) => setEvents(d.events)).catch((e) => { toast(e.message, 'error'); setEvents([]); });
-  }, []);
-  const remove = async (ev) => {
-    if (!confirm(`Delete “${ev.name}”? This can't be undone.`)) return;
-    setBusyId(ev.id);
-    try { await api(`/api/events?id=${ev.id}`, { method: 'DELETE' }); setEvents((list) => list.filter((x) => x.id !== ev.id)); toast(`Deleted “${ev.name}”`); }
-    catch (e) { toast(e.message, 'error'); }
-    setBusyId(null);
-  };
-  const open = async (ev) => { setBusyId(ev.id); if (!(await onOpen(ev))) setBusyId(null); };
-  const fmt = (iso) => { const d = new Date(iso); return isNaN(d) ? '' : d.toLocaleDateString([], { month: 'short', day: 'numeric', year: 'numeric' }); };
-  return (
-    <Modal title="My events" icon="CalendarClock" onClose={onClose} wide
-      footer={<><button className={btn.secondary} onClick={onNew}><Icon name="Plus" />Start a new event</button><button className={btn.primary} onClick={onClose}>Done</button></>}>
-      {events === null ? (
-        <div className="flex items-center justify-center gap-2 py-10 text-sm text-stone-500"><Icon name="Loader2" className="h-4 w-4 animate-spin" />Loading your events…</div>
-      ) : events.length === 0 ? (
-        <div className="py-10 text-center">
-          <Icon name="CalendarClock" className="mx-auto h-10 w-10 text-stone-300" />
-          <p className="mt-3 font-semibold text-stone-600">No saved events yet</p>
-          <p className="mt-1 text-sm text-stone-500">Add recipes, build a plan, then click <b>Save</b> at the top of the page.</p>
-        </div>
-      ) : (
-        <ul className="divide-y divide-stone-100 rounded-xl border border-stone-200">
-          {events.map((ev) => (
-            <li key={ev.id} className={`flex flex-wrap items-center gap-3 px-4 py-3 ${current?.id === ev.id ? 'bg-orange-50' : ''}`}>
-              <div className="min-w-0 flex-1">
-                <div className="flex items-center gap-2 font-semibold">
-                  <span className="truncate">{ev.name}</span>
-                  {current?.id === ev.id && <span className="rounded-full bg-orange-100 px-2 py-0.5 text-[11px] font-bold text-orange-700">open now</span>}
-                </div>
-                <div className="mt-0.5 text-xs text-stone-500">
-                  {ev.when && <>{fmt(ev.when)} · </>}{ev.recipeCount} recipe{ev.recipeCount === 1 ? '' : 's'}{ev.hasPlan ? ' · plan built' : ''} · saved {fmt(ev.updatedAt)}
-                </div>
-              </div>
-              <div className="flex gap-1">
-                <button className={btn.secondary + ' !py-1.5'} disabled={busyId === ev.id} onClick={() => open(ev)}>{busyId === ev.id ? <Icon name="Loader2" className="h-4 w-4 animate-spin" /> : 'Open'}</button>
-                <button className={btn.ghost + ' hover:!text-red-600'} disabled={busyId === ev.id} onClick={() => remove(ev)} aria-label={`Delete ${ev.name}`}><Icon name="Trash2" /></button>
-              </div>
-            </li>
-          ))}
-        </ul>
-      )}
-    </Modal>
-  );
-}
-
 function ImportPanel({ onImport, busy, progress }) {
   const [drag, setDrag] = useState(false);
   const [paste, setPaste] = useState('');
@@ -1631,7 +1510,7 @@ function RecipesStep({ recipes, setRecipes, onEdit, onImport, busy, progress, on
 }
 
 /* ================================================================
-   Step 3 – Schedule settings
+   15. Step 3 – Schedule settings
    ================================================================ */
 function ChoiceCard({ active, onClick, icon, title, children }) {
   return (
@@ -1706,7 +1585,7 @@ function ScheduleStep({ settings, setSettings, recipes, onGenerate }) {
 }
 
 /* ================================================================
-   Step 4 – Plan: alerts, Gantt, checklist, exports
+   16. Step 4 – Master plan (alerts, timeline, checklist)
    ================================================================ */
 function AlertsPanel({ alerts, onAction }) {
   const [open, setOpen] = useState(true);
@@ -1981,7 +1860,7 @@ function PrintView({ plan, checked }) {
 }
 
 /* ================================================================
-   Clarifying questions modal
+   17. Clarifying questions pop-up
    ================================================================ */
 function ClarifyModal({ data, onApply, onClose }) {
   const [vals, setVals] = useState(() => Object.fromEntries(data.questions.map((q) => [q.key, q.value])));
@@ -2041,7 +1920,156 @@ function ClarifyModal({ data, onApply, onClose }) {
 }
 
 /* ================================================================
-   App
+   18. Accounts & saved events
+   ================================================================ */
+function AuthModal({ initialMode = 'signin', onDone, onClose }) {
+  const [mode, setMode] = useState(initialMode);
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [show, setShow] = useState(false);
+  const [error, setError] = useState('');
+  const [busy, setBusy] = useState(false);
+  const signup = mode === 'signup';
+  const submit = async (e) => {
+    e.preventDefault();
+    setError('');
+    if (password.length < 6) { setError('Your password needs at least 6 characters.'); return; }
+    setBusy(true);
+    try {
+      const data = await api(`/api/auth?action=${signup ? 'signup' : 'signin'}`, { method: 'POST', body: { email, password } });
+      onDone(data.user, signup);
+    } catch (err) { setError(err.message); setBusy(false); }
+  };
+  return (
+    <Modal title={signup ? 'Create your account' : 'Sign in'} icon="Users" onClose={onClose}>
+      <div className="mb-4 flex gap-1 rounded-xl bg-stone-100 p-1">
+        {[['signin', 'Sign in'], ['signup', 'Create account']].map(([k, l]) => (
+          <button key={k} type="button" onClick={() => { setMode(k); setError(''); }}
+            className={`flex-1 rounded-lg py-2 text-sm font-semibold transition ${mode === k ? 'bg-white text-stone-900 shadow-sm' : 'text-stone-500 hover:text-stone-800'}`}>{l}</button>
+        ))}
+      </div>
+      <form onSubmit={submit} className="space-y-3">
+        <Field label="Email">
+          <input type="email" required autoComplete="email" autoFocus className={inputCls} value={email} onChange={(e) => setEmail(e.target.value)} placeholder="you@example.com" />
+        </Field>
+        <Field label="Password" hint={signup ? 'At least 6 characters.' : ''}>
+          <div className="relative">
+            <input type={show ? 'text' : 'password'} required minLength={6} autoComplete={signup ? 'new-password' : 'current-password'}
+              className={inputCls + ' pr-16'} value={password} onChange={(e) => setPassword(e.target.value)} />
+            <button type="button" onClick={() => setShow((v) => !v)} className="absolute right-2 top-1/2 -translate-y-1/2 rounded px-2 py-1 text-xs font-semibold text-stone-500 hover:bg-stone-100">{show ? 'Hide' : 'Show'}</button>
+          </div>
+        </Field>
+        {error && <p className="flex items-start gap-2 rounded-lg bg-red-50 px-3 py-2 text-sm text-red-700"><Icon name="AlertTriangle" className="mt-0.5 h-4 w-4 shrink-0" />{error}</p>}
+        <button type="submit" className={btn.primary + ' w-full'} disabled={busy}>
+          {busy && <Icon name="Loader2" className="h-4 w-4 animate-spin" />}{signup ? 'Create account' : 'Sign in'}
+        </button>
+      </form>
+    </Modal>
+  );
+}
+
+function AccountMenu({ me, onSignIn, onEvents, onNew, onSignOut }) {
+  const [open, setOpen] = useState(false);
+  if (!me.accounts) return null;
+  if (!me.user) return <button className={btn.secondary} onClick={onSignIn}><Icon name="Users" />Sign in</button>;
+  const act = (fn) => () => { setOpen(false); fn(); };
+  return (
+    <div className="relative">
+      <button className={btn.secondary + ' !pl-1.5'} onClick={() => setOpen((o) => !o)} aria-expanded={open} aria-label="Account menu">
+        <span className="grid h-7 w-7 place-items-center rounded-full bg-orange-600 text-xs font-bold text-white">{me.user.email[0].toUpperCase()}</span>
+        <span className="hidden max-w-[160px] truncate md:inline">{me.user.email}</span>
+        <Icon name="ChevronDown" className="h-4 w-4 text-stone-400" />
+      </button>
+      {open && <>
+        <div className="fixed inset-0 z-40" onClick={() => setOpen(false)} />
+        <div className="absolute right-0 z-50 mt-2 w-60 rounded-xl border border-stone-200 bg-white p-2 shadow-lg">
+          <div className="truncate px-2 py-1.5 text-sm font-semibold">{me.user.email}</div>
+          <div className="my-1 border-t border-stone-100" />
+          <button className={btn.ghost + ' w-full !justify-start'} onClick={act(onEvents)}><Icon name="CalendarClock" />My events</button>
+          <button className={btn.ghost + ' w-full !justify-start'} onClick={act(onNew)}><Icon name="Plus" />Start a new event</button>
+          <button className={btn.ghost + ' w-full !justify-start'} onClick={act(onSignOut)}><Icon name="ChevronLeft" />Sign out</button>
+        </div>
+      </>}
+    </div>
+  );
+}
+
+function SaveEventModal({ current, suggestedName, recipeCount, hasPlan, onSave, onClose }) {
+  const [name, setName] = useState(current?.name || suggestedName);
+  const [busy, setBusy] = useState(false);
+  const save = async (asNew) => { setBusy(true); const ok = await onSave(name.trim(), asNew); if (!ok) setBusy(false); };
+  return (
+    <Modal title={current ? 'Save event' : 'Save this event'} icon="CalendarClock" onClose={onClose}
+      footer={<>
+        <button className={btn.secondary} onClick={onClose}>Cancel</button>
+        {current && <button className={btn.secondary} disabled={busy || !name.trim()} onClick={() => save(true)}>Save as new event</button>}
+        <button className={btn.primary} disabled={busy || !name.trim()} onClick={() => save(false)}>
+          {busy && <Icon name="Loader2" className="h-4 w-4 animate-spin" />}{current ? 'Save changes' : 'Save event'}
+        </button>
+      </>}>
+      <form onSubmit={(e) => { e.preventDefault(); if (name.trim()) save(false); }}>
+        <Field label="Event name">
+          <input className={inputCls} autoFocus maxLength={80} value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. Thanksgiving 2026" />
+        </Field>
+      </form>
+      <p className="mt-3 text-sm text-stone-600">Saves your {recipeCount} recipe{recipeCount === 1 ? '' : 's'}, kitchen setup, schedule settings{hasPlan ? ', master plan and checklist progress' : ''} to your account, so you can open it on any device.</p>
+    </Modal>
+  );
+}
+
+function EventsModal({ current, onOpen, onNew, onClose, toast }) {
+  const [events, setEvents] = useState(null);
+  const [busyId, setBusyId] = useState(null);
+  useEffect(() => {
+    api('/api/events').then((d) => setEvents(d.events)).catch((e) => { toast(e.message, 'error'); setEvents([]); });
+  }, []);
+  const remove = async (ev) => {
+    if (!confirm(`Delete “${ev.name}”? This can't be undone.`)) return;
+    setBusyId(ev.id);
+    try { await api(`/api/events?id=${ev.id}`, { method: 'DELETE' }); setEvents((list) => list.filter((x) => x.id !== ev.id)); toast(`Deleted “${ev.name}”`); }
+    catch (e) { toast(e.message, 'error'); }
+    setBusyId(null);
+  };
+  const open = async (ev) => { setBusyId(ev.id); if (!(await onOpen(ev))) setBusyId(null); };
+  const fmt = (iso) => { const d = new Date(iso); return isNaN(d) ? '' : d.toLocaleDateString([], { month: 'short', day: 'numeric', year: 'numeric' }); };
+  return (
+    <Modal title="My events" icon="CalendarClock" onClose={onClose} wide
+      footer={<><button className={btn.secondary} onClick={onNew}><Icon name="Plus" />Start a new event</button><button className={btn.primary} onClick={onClose}>Done</button></>}>
+      {events === null ? (
+        <div className="flex items-center justify-center gap-2 py-10 text-sm text-stone-500"><Icon name="Loader2" className="h-4 w-4 animate-spin" />Loading your events…</div>
+      ) : events.length === 0 ? (
+        <div className="py-10 text-center">
+          <Icon name="CalendarClock" className="mx-auto h-10 w-10 text-stone-300" />
+          <p className="mt-3 font-semibold text-stone-600">No saved events yet</p>
+          <p className="mt-1 text-sm text-stone-500">Add recipes, build a plan, then click <b>Save</b> at the top of the page.</p>
+        </div>
+      ) : (
+        <ul className="divide-y divide-stone-100 rounded-xl border border-stone-200">
+          {events.map((ev) => (
+            <li key={ev.id} className={`flex flex-wrap items-center gap-3 px-4 py-3 ${current?.id === ev.id ? 'bg-orange-50' : ''}`}>
+              <div className="min-w-0 flex-1">
+                <div className="flex items-center gap-2 font-semibold">
+                  <span className="truncate">{ev.name}</span>
+                  {current?.id === ev.id && <span className="rounded-full bg-orange-100 px-2 py-0.5 text-[11px] font-bold text-orange-700">open now</span>}
+                </div>
+                <div className="mt-0.5 text-xs text-stone-500">
+                  {ev.when && <>{fmt(ev.when)} · </>}{ev.recipeCount} recipe{ev.recipeCount === 1 ? '' : 's'}{ev.hasPlan ? ' · plan built' : ''} · saved {fmt(ev.updatedAt)}
+                </div>
+              </div>
+              <div className="flex gap-1">
+                <button className={btn.secondary + ' !py-1.5'} disabled={busyId === ev.id} onClick={() => open(ev)}>{busyId === ev.id ? <Icon name="Loader2" className="h-4 w-4 animate-spin" /> : 'Open'}</button>
+                <button className={btn.ghost + ' hover:!text-red-600'} disabled={busyId === ev.id} onClick={() => remove(ev)} aria-label={`Delete ${ev.name}`}><Icon name="Trash2" /></button>
+              </div>
+            </li>
+          ))}
+        </ul>
+      )}
+    </Modal>
+  );
+}
+
+/* ================================================================
+   19. App – holds all the state and ties the steps together
    ================================================================ */
 const STEPS = [
   { key: 'kitchen', label: 'Kitchen', icon: 'Flame' },
