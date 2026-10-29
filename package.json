@@ -1,0 +1,16 @@
+{
+  "name": "kitchen-sync",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vercel dev",
+    "deploy": "vercel --prod"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "0.134.0",
+    "@upstash/redis": "1.39.0"
+  },
+  "devDependencies": {
+    "vercel": "64.1.0"
+  }
+}

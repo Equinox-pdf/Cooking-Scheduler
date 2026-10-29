@@ -1,0 +1,2325 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Kitchen Sync</title>
+<meta name="description" content="Kitchen Sync – an intelligent cooking & baking schedule planner for multi-recipe sessions." />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+<script src="https://cdn.tailwindcss.com/3.4.5"></script>
+<script>
+  tailwind.config = {
+    theme: { extend: { fontFamily: { sans: ['Inter', 'ui-sans-serif', 'system-ui', 'sans-serif'] } } }
+  };
+</script>
+<style>
+  body { background: #fafaf9; }
+  .stripes { background-image: repeating-linear-gradient(135deg, rgba(255,255,255,.55) 0 6px, transparent 6px 12px); }
+  .scroll-thin::-webkit-scrollbar { height: 8px; width: 8px; }
+  .scroll-thin::-webkit-scrollbar-thumb { background: #d6d3d1; border-radius: 8px; }
+  .tabular { font-variant-numeric: tabular-nums; }
+  @media print {
+    @page { margin: 12mm; }
+    body { background: #fff; }
+  }
+</style>
+<script crossorigin src="https://unpkg.com/react@18.3.1/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
+<script>window.react = window.React; /* lucide-react UMD looks for a lowercase global */</script>
+<script crossorigin src="https://unpkg.com/lucide-react@0.344.0/dist/umd/lucide-react.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone@7.24.7/babel.min.js"></script>
+</head>
+<body class="text-stone-800 antialiased">
+<div id="root">
+  <div style="font-family:system-ui;padding:48px;text-align:center;color:#78716c">Loading Kitchen Sync…</div>
+</div>
+<noscript>Kitchen Sync needs JavaScript enabled.</noscript>
+
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useMemo, useRef } = React;
+
+/* ================================================================
+   Utilities
+   ================================================================ */
+const uid = () => Math.random().toString(36).slice(2, 9);
+const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
+const num = (v, d = 0) => { const n = parseFloat(v); return Number.isFinite(n) ? n : d; };
+const int0 = (v) => Math.max(0, Math.round(num(v, 0)));
+const ceilTo = (x, s = 5) => Math.ceil(x / s) * s;
+const floorTo = (x, s = 5) => Math.floor(x / s) * s;
+const pad2 = (n) => String(n).padStart(2, '0');
+const toLocalInput = (d) => `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}T${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+const fromLocalInput = (s) => { if (!s) return null; const d = new Date(s); return isNaN(d) ? null : d; };
+const atMin = (base, m) => new Date(base.getTime() + m * 60000);
+const fmtClock = (d) => d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+const sameDay = (a, b) => a.toDateString() === b.toDateString();
+function fmtAt(base, m, refDay) {
+  const d = atMin(base, m);
+  const s = fmtClock(d);
+  return !refDay || sameDay(d, refDay) ? s : `${s} (${d.toLocaleDateString([], { weekday: 'short' })})`;
+}
+function fmtDur(m) {
+  m = Math.round(m);
+  if (m < 60) return `${m} min`;
+  const h = Math.floor(m / 60), r = m % 60;
+  return r ? `${h}h ${r}m` : `${h}h`;
+}
+const store = {
+  get(k, d) { try { const v = localStorage.getItem(k); return v ? JSON.parse(v) : d; } catch { return d; } },
+  set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} },
+};
+const scriptCache = {};
+function loadScript(src) {
+  if (!scriptCache[src]) {
+    scriptCache[src] = new Promise((resolve, reject) => {
+      const s = document.createElement('script');
+      s.src = src; s.async = true;
+      s.onload = resolve;
+      s.onerror = () => { delete scriptCache[src]; reject(new Error('Could not load ' + src)); };
+      document.head.appendChild(s);
+    });
+  }
+  return scriptCache[src];
+}
+function download(filename, blob) {
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = filename;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+}
+const slug = (s) => (s || 'plan').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+
+const LIBS = {
+  tesseract: 'https://cdn.jsdelivr.net/npm/tesseract.js@5.1.0/dist/tesseract.min.js',
+  pdfjs: 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js',
+  pdfWorker: 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js',
+  xlsx: 'https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js',
+};
+
+/* ================================================================
+   Icons (lucide-react UMD, graceful fallback)
+   ================================================================ */
+function Icon({ name, className = 'w-4 h-4', ...rest }) {
+  const C = (window.LucideReact || {})[name];
+  return C ? <C className={className} aria-hidden="true" {...rest} /> : <span className={'inline-block ' + className} />;
+}
+
+/* ================================================================
+   Domain constants
+   ================================================================ */
+const CATEGORIES = ['Main', 'Side', 'Dessert', 'Appetizer', 'Breakfast', 'Bread', 'Sauce', 'Drink', 'Other'];
+const RECIPE_COLORS = ['#ea580c', '#0284c7', '#16a34a', '#9333ea', '#db2777', '#ca8a04', '#0d9488', '#4f46e5', '#dc2626', '#65a30d'];
+
+const PHASES = {
+  preheat:  { label: 'Preheat / temp change', hex: '#fda4af', cls: 'bg-rose-300 text-rose-950 stripes' },
+  prep:     { label: 'Prep',                  hex: '#38bdf8', cls: 'bg-sky-400 text-sky-950' },
+  wait:     { label: 'Chill / Rise',          hex: '#a5b4fc', cls: 'bg-indigo-300 text-indigo-950' },
+  active:   { label: 'Active cooking',        hex: '#f59e0b', cls: 'bg-amber-500 text-amber-950' },
+  bake:     { label: 'Baking / Roasting',     hex: '#ef4444', cls: 'bg-red-500 text-white' },
+  simmer:   { label: 'Simmering',             hex: '#fb923c', cls: 'bg-orange-400 text-orange-950' },
+  hold:     { label: 'Hands-off set',         hex: '#c4b5fd', cls: 'bg-violet-300 text-violet-950' },
+  rest:     { label: 'Resting / Cooling',     hex: '#2dd4bf', cls: 'bg-teal-400 text-teal-950' },
+  warm:     { label: 'Keep warm',             hex: '#e7e5e4', cls: 'bg-stone-200 text-stone-600 stripes' },
+  serve:    { label: 'Serving',               hex: '#059669', cls: 'bg-emerald-600 text-white' },
+};
+const EVENT_DOT = { ...Object.fromEntries(Object.entries(PHASES).map(([k, v]) => [k, v.hex])), oven: '#e11d48', ready: '#10b981', break: '#a8a29e' };
+
+const STRATEGIES = {
+  express: { label: 'Express', share: true, tolerance: 25, cookBuffer: 0, ovenBuffer: 0 },
+  chill:   { label: 'Chill Baking', share: false, tolerance: 0, cookBuffer: 10, ovenBuffer: 5 },
+};
+const stratParams = (settings) => {
+  const s = STRATEGIES[settings.strategy] || STRATEGIES.express;
+  return { ...s, cookBuffer: settings.strategy === 'chill' ? int0(settings.buffer) : 0 };
+};
+
+/* Oven physics: heat ~20°F/min, cool ~8°F/min with the door cracked. */
+const AMBIENT = 70;
+function transMin(from, to) {
+  if (from === to) return 0;
+  const d = to > from ? (to - from) / 20 : (from - to) / 8;
+  return Math.max(5, ceilTo(d, 5));
+}
+/* Rule of thumb: every 25°F lower adds ~10% time. */
+const adjDur = (d, from, to) => {
+  const v = d * (1 + (from - to) / 250);
+  return Math.max(1, d >= 20 ? Math.round(v / 5) * 5 : Math.round(v));
+};
+
+/* ================================================================
+   Equipment knowledge
+   ================================================================ */
+const EQUIP_PATTERNS = [
+  [/stand\s*mixer|kitchenaid/i, 'Stand Mixer'],
+  [/hand\s*mixer|electric\s*mixer/i, 'Hand Mixer'],
+  [/food\s*processor/i, 'Food Processor'],
+  [/blender/i, 'Blender'],
+  [/stock\s*pot|large\s*pot/i, 'Stockpot'],
+  [/dutch\s*oven/i, 'Dutch Oven'],
+  [/sauce\s*pan/i, 'Saucepan'],
+  [/skillet|frying\s*pan|saut[eé]\s*pan/i, 'Skillet'],
+  [/griddle/i, 'Griddle'],
+  [/waffle\s*iron/i, 'Waffle Iron'],
+  [/sheet\s*pan|baking\s*sheet|cookie\s*sheet|rimmed\s*sheet/i, 'Sheet Pan'],
+  [/roasting\s*pan/i, 'Roasting Pan'],
+  [/casserole|baking\s*dish|9\s*[x×]\s*13/i, 'Casserole Dish'],
+  [/pie\s*(?:plate|dish|pan)/i, 'Pie Dish'],
+  [/cake\s*pan|springform|bundt/i, 'Cake Pan'],
+  [/muffin\s*(?:tin|pan)|cupcake\s*pan/i, 'Muffin Tin'],
+  [/loaf\s*pan/i, 'Loaf Pan'],
+  [/rolling\s*pin/i, 'Rolling Pin'],
+  [/piping\s*bag|pastry\s*bag/i, 'Piping Bag'],
+  [/meat\s*thermometer|instant[-\s]read/i, 'Meat Thermometer'],
+  [/candy\s*thermometer/i, 'Candy Thermometer'],
+  [/slow\s*cooker|crock\s*pot/i, 'Slow Cooker'],
+];
+const KNOWN_EQUIPMENT = EQUIP_PATTERNS.map(([, n]) => n);
+/* Which phase an item is tied up during: prep | handson | stove | bake | tool (not tracked) */
+function equipGroup(name) {
+  const n = String(name).toLowerCase();
+  if (/mixer|processor|blender|mandoline/.test(n)) return 'prep';
+  if (/rolling pin|piping|cutter/.test(n)) return 'handson';
+  if (/sheet|roasting|casserole|baking dish|pie|cake|muffin|loaf|tart|bundt|springform|ramekin/.test(n)) return 'bake';
+  if (/pot|skillet|saucepan|pan|griddle|wok|dutch oven|waffle|kettle/.test(n)) return 'stove';
+  return 'tool';
+}
+const EQUIP_GROUP_LABEL = { prep: 'during prep', handson: 'hands-on steps', stove: 'on the stovetop', bake: 'in the oven', tool: 'not tracked' };
+const defaultEqCount = (name) => (/sheet pan|casserole/i.test(name) ? 2 : 1);
+const eqCount = (settings, name) => {
+  const v = (settings.equipment || {})[name.toLowerCase()];
+  return v != null ? int0(v) : defaultEqCount(name);
+};
+
+/* ================================================================
+   Recipe model
+   ================================================================ */
+const blankRecipe = () => ({
+  id: uid(), name: '', category: 'Main',
+  prepTime: 15, waitTime: 0, waitLabel: 'Chill / rise',
+  activeTime: 0, activeOnStove: true,
+  passiveTime: 0, passiveWhere: 'oven', ovenTemp: 350, batches: 1, fullOven: false,
+  restTime: 0, equipment: [], notes: '', concurrent: true,
+});
+function normalizeRecipe(o) {
+  const r = { ...blankRecipe(), ...o };
+  ['prepTime', 'waitTime', 'activeTime', 'passiveTime', 'ovenTemp', 'restTime'].forEach((k) => (r[k] = int0(r[k])));
+  r.batches = Math.max(1, int0(r.batches) || 1);
+  r.equipment = Array.isArray(r.equipment) ? r.equipment.map(String).filter(Boolean)
+    : String(r.equipment || '').split(',').map((s) => s.trim()).filter(Boolean);
+  if (!['oven', 'stovetop', 'counter'].includes(r.passiveWhere)) r.passiveWhere = r.ovenTemp ? 'oven' : 'counter';
+  if (!CATEGORIES.includes(r.category)) r.category = 'Other';
+  r.concurrent = r.concurrent !== false && r.concurrent !== 'No';
+  r.activeOnStove = r.activeOnStove !== false;
+  r.fullOven = !!r.fullOven;
+  if (!r.id) r.id = uid();
+  return r;
+}
+const isOvenRecipe = (r) => r.passiveWhere === 'oven' && r.passiveTime > 0;
+const usesBurner = (r) => (r.activeTime > 0 && r.activeOnStove) || (r.passiveWhere === 'stovetop' && r.passiveTime > 0);
+const chainLen = (r) => r.prepTime + r.waitTime + r.activeTime + r.passiveTime * (isOvenRecipe(r) ? Math.ceil(r.batches / 2) : 1) + r.restTime;
+
+/* ================================================================
+   Sample recipe sets
+   ================================================================ */
+const SAMPLE_SETS = [
+  {
+    id: 'thanksgiving', name: 'Classic Thanksgiving Feast', icon: 'Utensils',
+    blurb: 'Turkey, stuffing, green bean casserole, mashed potatoes & pumpkin pie.',
+    anchor: { mode: 'target', h: 16, m: 0 },
+    recipes: [
+      { name: 'Roast Turkey', category: 'Main', prepTime: 30, passiveTime: 180, passiveWhere: 'oven', ovenTemp: 325, restTime: 30,
+        equipment: ['Roasting Pan', 'Meat Thermometer'],
+        notes: '14-lb bird, fully thawed. Pat dry, rub herb butter under the skin, season inside & out. Roast until the thigh reads 165°F; baste every 45 min. Tent with foil to rest.' },
+      { name: 'Sausage & Herb Stuffing', category: 'Side', prepTime: 25, activeTime: 15, activeOnStove: true, passiveTime: 40, passiveWhere: 'oven', ovenTemp: 350, restTime: 10,
+        equipment: ['Skillet', 'Casserole Dish'],
+        notes: 'Cube & dry 1 loaf bread. Brown sausage, sauté onion, celery, sage & thyme in butter. Toss with bread, 2 eggs & 2 cups stock. Bake covered 25 min, uncovered 15.' },
+      { name: 'Green Bean Casserole', category: 'Side', prepTime: 15, activeTime: 10, activeOnStove: true, passiveTime: 30, passiveWhere: 'oven', ovenTemp: 350, restTime: 5,
+        equipment: ['Stockpot', 'Casserole Dish'],
+        notes: 'Trim 2 lb green beans; blanch 4 min and shock in ice water. Mix with mushroom sauce, top with crispy onions in the last 5 minutes.' },
+      { name: 'Mashed Potatoes', category: 'Side', prepTime: 20, activeTime: 10, activeOnStove: true, passiveTime: 20, passiveWhere: 'stovetop', ovenTemp: 0, restTime: 0,
+        equipment: ['Stockpot'],
+        notes: 'Peel & cube 4 lb Yukon Golds. Start in cold salted water, bring to a boil, simmer until tender. Mash with warm cream & butter right before serving.' },
+      { name: 'Pumpkin Pie', category: 'Dessert', prepTime: 20, passiveTime: 55, passiveWhere: 'oven', ovenTemp: 375, restTime: 120,
+        equipment: ['Pie Dish', 'Stand Mixer'],
+        notes: 'Blind-bake-free deep-dish crust. Whisk pumpkin purée, eggs, brown sugar, evaporated milk & spices. Bake until the center barely jiggles; cool completely.' },
+    ],
+  },
+  {
+    id: 'cookies', name: 'Holiday Cookie Marathon', icon: 'Sparkles',
+    blurb: 'Sugar cookies, gingerbread, peppermint meringues & snickerdoodles.',
+    anchor: { mode: 'start', h: 9, m: 0 },
+    recipes: [
+      { name: 'Cut-Out Sugar Cookies', category: 'Dessert', prepTime: 20, waitTime: 60, waitLabel: 'Chill dough', activeTime: 20, activeOnStove: false,
+        passiveTime: 10, passiveWhere: 'oven', ovenTemp: 350, batches: 3, restTime: 30,
+        equipment: ['Stand Mixer', 'Rolling Pin', 'Sheet Pan'],
+        notes: 'Cream butter & sugar, add egg + vanilla, mix in flour. Chill disks 1 hr. Roll ¼" thick, cut shapes. Bake until edges barely turn golden. Cool before icing.' },
+      { name: 'Gingerbread People', category: 'Dessert', prepTime: 20, waitTime: 120, waitLabel: 'Chill dough', activeTime: 25, activeOnStove: false,
+        passiveTime: 10, passiveWhere: 'oven', ovenTemp: 350, batches: 3, restTime: 30,
+        equipment: ['Stand Mixer', 'Rolling Pin', 'Sheet Pan'],
+        notes: 'Molasses, brown sugar, ginger, cinnamon, cloves. Chill 2 hrs. Roll ⅛" thick. Pipe royal icing once fully cool.' },
+      { name: 'Peppermint Meringues', category: 'Dessert', prepTime: 25, passiveTime: 90, passiveWhere: 'oven', ovenTemp: 200, restTime: 60,
+        equipment: ['Stand Mixer', 'Piping Bag', 'Sheet Pan'],
+        notes: 'Whip 4 egg whites + cream of tartar to soft peaks, stream in sugar to stiff glossy peaks, add peppermint extract. Paint red stripes inside the piping bag and pipe kisses. Low & slow.' },
+      { name: 'Snickerdoodles', category: 'Dessert', prepTime: 15, activeTime: 10, activeOnStove: false, passiveTime: 11, passiveWhere: 'oven', ovenTemp: 375, batches: 2, restTime: 15,
+        equipment: ['Stand Mixer', 'Sheet Pan'],
+        notes: 'Roll dough balls in cinnamon sugar. Bake until puffed and just set in the middle.' },
+    ],
+  },
+  {
+    id: 'brunch', name: 'Weekend Brunch', icon: 'Coffee',
+    blurb: 'Quiche, cinnamon rolls, sheet-pan bacon, pancakes & fruit salad.',
+    anchor: { mode: 'target', h: 10, m: 30 },
+    recipes: [
+      { name: 'Spinach & Gruyère Quiche', category: 'Main', prepTime: 20, activeTime: 10, activeOnStove: true, passiveTime: 40, passiveWhere: 'oven', ovenTemp: 375, restTime: 10,
+        equipment: ['Skillet', 'Pie Dish'],
+        notes: 'Sauté shallot & spinach, squeeze dry. Whisk 6 eggs + 1½ cups half-and-half, add Gruyère. Pour into crust and bake until just set.' },
+      { name: 'Cinnamon Rolls', category: 'Bread', prepTime: 25, waitTime: 60, waitLabel: 'Let dough rise', activeTime: 15, activeOnStove: false,
+        passiveTime: 25, passiveWhere: 'oven', ovenTemp: 350, restTime: 10,
+        equipment: ['Stand Mixer', 'Rolling Pin', 'Cake Pan'],
+        notes: 'Enriched yeast dough; knead 8 min in mixer. Rise until doubled, roll out, spread cinnamon butter, roll & slice 12. Glaze while warm.' },
+      { name: 'Sheet-Pan Bacon', category: 'Breakfast', prepTime: 5, passiveTime: 20, passiveWhere: 'oven', ovenTemp: 400, restTime: 5,
+        equipment: ['Sheet Pan'], notes: 'Lay thick-cut bacon on a rack over a foil-lined sheet pan. Drain on paper towels.' },
+      { name: 'Buttermilk Pancakes', category: 'Breakfast', prepTime: 10, activeTime: 25, activeOnStove: true, passiveTime: 0, passiveWhere: 'counter', ovenTemp: 0, restTime: 0,
+        equipment: ['Griddle'], notes: 'Whisk dry + wet separately, combine with lumps remaining. Cook ¼-cup portions on a buttered griddle; flip when bubbles pop.' },
+      { name: 'Citrus Fruit Salad', category: 'Side', prepTime: 15, passiveTime: 30, passiveWhere: 'counter', ovenTemp: 0, restTime: 0,
+        equipment: [], notes: 'Segment oranges & grapefruit, add berries, mint and a drizzle of honey-lime. Chill to let flavors meld.' },
+    ],
+  },
+];
+
+/* ================================================================
+   Recipe import / parsing (text, JSON, schema.org, HTML, PDF, images)
+   ================================================================ */
+const DUR_SRC = String.raw`(\d+(?:[.,]\d+)?(?:\s*(?:-|–|to)\s*\d+(?:[.,]\d+)?)?\s*(?:hours?|hrs?|h|minutes?|mins?|m)\b(?:\s*(?:and\s*)?\d+\s*(?:minutes?|mins?|m)\b)?)`;
+function parseMinutes(str) {
+  if (str == null || str === '') return null;
+  if (typeof str === 'number') return Math.round(str);
+  let s = String(str).trim();
+  if (/^P/i.test(s)) {
+    const iso = s.match(/^P(?:(\d+)D)?T?(?:(\d+(?:\.\d+)?)H)?(?:(\d+(?:\.\d+)?)M)?/i);
+    if (iso && (iso[1] || iso[2] || iso[3])) return Math.round(num(iso[1]) * 1440 + num(iso[2]) * 60 + num(iso[3]));
+  }
+  s = s.toLowerCase().replace(/½/g, '.5').replace(/¼/g, '.25').replace(/¾/g, '.75').replace(/(\d),(\d)/g, '$1.$2');
+  s = s.replace(/(\d+(?:\.\d+)?)\s*(?:-|–|to)\s*(\d+(?:\.\d+)?)/g, '$2');
+  let total = 0, found = false;
+  const h = s.match(/(\d+(?:\.\d+)?)\s*(?:hours?|hrs?|h)\b/); if (h) { total += parseFloat(h[1]) * 60; found = true; }
+  const m = s.match(/(\d+(?:\.\d+)?)\s*(?:minutes?|mins?|m)\b/); if (m) { total += parseFloat(m[1]); found = true; }
+  if (!found) { const n = s.match(/\d+(?:\.\d+)?/); if (!n) return null; total = parseFloat(n[0]); }
+  return Math.round(total);
+}
+function labeled(text, labelSrc) {
+  const re = new RegExp(String.raw`(?:^|[^a-z])(?:${labelSrc})[^\d\n]{0,25}?` + DUR_SRC, 'i');
+  const m = text.match(re);
+  return m ? parseMinutes(m[1]) : null;
+}
+
+function detectTemp(text) {
+  const t = text.replace(/º/g, '°');
+  const ovenish = /\boven|\bbake|\broast/i.test(t);
+  const m = t.match(/(?:pre-?heat|heat)\s+(?:the\s+|your\s+)?oven\s+to\s+(\d{3})\s*°?\s*([FC])?/i)
+    || (ovenish && (t.match(/(\d{3})\s*°\s*([FC])?/i) || t.match(/(\d{3})\s*degrees\s*(F|C|fahrenheit|celsius)?/i)));
+  if (!m) return 0;
+  let v = parseInt(m[1], 10);
+  const unit = (m[2] || '').toUpperCase();
+  if (unit.startsWith('C')) v = Math.round((v * 9 / 5 + 32) / 5) * 5;
+  return v >= 150 && v <= 600 ? v : 0;
+}
+function guessCategory(name, text) {
+  const tests = [
+    ['Dessert', /pie|cookie|cake|brownie|tart|pudding|crumble|cobbler|fudge|candy|meringue|peppermint|gingerbread|cupcake|cheesecake|snickerdoodle/i],
+    ['Breakfast', /pancake|waffle|bacon|french toast|frittata|omelet|scrambl|granola/i],
+    ['Bread', /bread|rolls?\b|biscuit|focaccia|brioche|scone|muffin|bun/i],
+    ['Main', /turkey|chicken|beef|pork|ham\b|roast|lamb|salmon|fish|lasagna|steak|brisket|quiche|meatloaf|tenderloin|shrimp/i],
+    ['Side', /casserole|stuffing|dressing|potato|beans|salad|vegetable|rice|carrot|sprouts|corn|squash|slaw/i],
+    ['Sauce', /gravy|sauce|cranberr|dressing|aioli/i],
+    ['Appetizer', /dip|appetizer|crostini|bruschetta|deviled|wings|canap/i],
+    ['Drink', /punch|cider|cocktail|lemonade|eggnog|cocoa|smoothie/i],
+  ];
+  for (const [c, re] of tests) if (re.test(name)) return c;
+  for (const [c, re] of tests) if (re.test(text.slice(0, 800))) return c;
+  return 'Other';
+}
+
+function parseRecipeText(text, sourceName = 'Imported recipe') {
+  const raw = String(text || '').replace(/\r/g, '').replace(/\t/g, ' ');
+  const lines = raw.split('\n').map((l) => l.trim());
+  const lower = lines.map((l) => l.toLowerCase().replace(/^[#*\s]+/, ''));
+  const ingIdx = lower.findIndex((l) => /^ingredients\b/.test(l));
+  const insIdx = lower.findIndex((l) => /^(instructions|directions|method|steps|preparation)\b/.test(l));
+  const ingredients = ingIdx >= 0 ? lines.slice(ingIdx + 1, insIdx > ingIdx ? insIdx : undefined).filter(Boolean) : [];
+  const instructions = insIdx >= 0 ? lines.slice(insIdx + 1, ingIdx > insIdx ? ingIdx : undefined).filter(Boolean) : [];
+  const firstSection = [ingIdx, insIdx].filter((i) => i >= 0).sort((a, b) => a - b)[0];
+  const header = firstSection != null ? lines.slice(0, firstSection).join('\n') : raw.slice(0, 600);
+  const body = instructions.length ? instructions.join('\n') : raw;
+
+  let name = (raw.match(/^\s*(?:title|recipe(?:\s*name)?)\s*[:\-]\s*(.+)$/im) || [])[1];
+  if (!name) {
+    name = lines.find((l) => l && l.length < 80 && /[a-z]/i.test(l)
+      && !/^[#*\s]*(ingredients|instructions|directions|method|prep|cook|total|serves|servings|yield|makes|by\b|author)/i.test(l));
+  }
+  name = (name || sourceName.replace(/\.[a-z0-9]+$/i, '')).replace(/^[#*\s]+/, '').replace(/\s+/g, ' ').trim().slice(0, 80);
+
+  const review = [];
+  let prep = labeled(header, String.raw`prep(?:aration)?(?:\s*time)?|active\s*time|hands[-\s]on(?:\s*time)?`) ?? labeled(raw, String.raw`prep(?:aration)?\s*time`);
+  const cook = labeled(header, String.raw`cook(?:ing)?\s*time|bake\s*time|baking\s*time|roast(?:ing)?\s*time|cook|bake`) ?? labeled(raw, String.raw`cook(?:ing)?\s*time|bak(?:e|ing)\s*time`);
+  const total = labeled(header, String.raw`total(?:\s*time)?|ready\s*in`);
+  let chill = labeled(raw, String.raw`chill(?:ing)?(?:\s*time)?|refrigerat\w*|rise|rising|proof\w*|marinat\w*|inactive(?:\s*time)?`);
+  let rest = labeled(body, String.raw`rest|resting|cool|cooling|stand|sit`);
+
+  let bakeSum = 0, simmerSum = 0, activeSum = 0;
+  for (const s of body.split(/(?<=[.!?])\s+|\n/)) {
+    const d = [...s.matchAll(new RegExp(DUR_SRC, 'gi'))].reduce((sum, m) => sum + (parseMinutes(m[1]) || 0), 0);
+    if (!d) continue;
+    if (/\b(bake|roast|broil)\b/i.test(s)) bakeSum += d;
+    else if (/\b(simmer|braise)\b/i.test(s) || (/\bboil\b/i.test(s) && !/bring to a boil/i.test(s))) simmerSum += d;
+    else if (/\b(chill|refrigerate|rise|proof|marinate)\b/i.test(s)) { if (chill == null) chill = d; }
+    else if (/\b(rest|cool|stand)\b/i.test(s)) { if (rest == null) rest = d; }
+    else if (/\b(saut[eé]|stir|fry|sear|brown|whisk|cook|heat|blanch|toast|reduce)\b/i.test(s)) activeSum += d;
+  }
+
+  const temp = detectTemp(raw);
+  let where = 'counter', active = 0, passive = 0, activeOnStove = true;
+  if (temp) {
+    where = 'oven';
+    passive = cook || bakeSum || 0;
+    active = activeSum ? Math.min(activeSum, 30) : 0;
+    activeOnStove = /saut|skillet|stovetop|saucepan|boil|blanch|fry|sear/i.test(body);
+    if (!passive) review.push('passiveTime');
+  } else if (simmerSum || /simmer|boil|stovetop|skillet|saucepan|griddle|stockpot|fry|sear/i.test(body)) {
+    where = 'stovetop';
+    if (cook) { active = activeSum ? Math.min(activeSum, cook) : Math.min(15, cook); passive = simmerSum || Math.max(0, cook - active); }
+    else { active = activeSum; passive = simmerSum; }
+    if (!active && !passive) review.push('activeTime');
+    if (!passive) where = 'counter';
+  } else if (cook) {
+    passive = cook; where = 'counter';
+    review.push('passiveTime');
+  }
+  if (prep == null) {
+    const cooking = cook || active + passive;
+    if (total && total > cooking) prep = Math.max(5, total - cooking - (chill || 0));
+    else { prep = 15; review.push('prepTime'); }
+  }
+
+  const equipment = [];
+  for (const [re, n] of EQUIP_PATTERNS) if (re.test(raw) && !equipment.includes(n)) equipment.push(n);
+  let batches = 1;
+  const b = raw.match(/(\d+)\s*batch(?:es)?/i);
+  if (b) batches = clamp(parseInt(b[1], 10), 1, 12);
+  else if (temp && equipment.includes('Sheet Pan')) {
+    const dz = raw.match(/(?:makes|yield[s]?)[^\d\n]{0,12}(\d+)\s*dozen/i);
+    if (dz) batches = clamp(parseInt(dz[1], 10), 1, 12);
+  }
+  const category = guessCategory(name, raw);
+  if (category === 'Other') review.push('category');
+
+  let notes = '';
+  if (ingredients.length) notes += 'Ingredients: ' + ingredients.join('; ');
+  if (instructions.length) notes += (notes ? '\n' : '') + 'Steps: ' + instructions.join(' ');
+  if (!notes) notes = raw.slice(0, 600);
+  if (notes.length > 900) notes = notes.slice(0, 900) + '…';
+
+  const recipe = normalizeRecipe({
+    name, category, prepTime: prep, waitTime: chill || 0, waitLabel: /rise|proof/i.test(raw) ? 'Let dough rise' : /marinat/i.test(raw) ? 'Marinate' : 'Chill / rise',
+    activeTime: active, activeOnStove, passiveTime: passive, passiveWhere: where, ovenTemp: temp || 0, batches,
+    restTime: rest || 0, equipment, notes, concurrent: true,
+  });
+  if (!name || name === sourceName) review.push('name');
+  if (review.length) recipe._review = [...new Set(review)];
+  return recipe;
+}
+
+function flattenInstructions(x) {
+  if (!x) return [];
+  if (typeof x === 'string') return x.split(/\n+/);
+  if (Array.isArray(x)) return x.flatMap(flattenInstructions);
+  if (x.itemListElement) return flattenInstructions(x.itemListElement);
+  if (x.text) return [x.text];
+  return [];
+}
+function fromSchemaOrg(o) {
+  const minutesText = (v) => { const m = parseMinutes(v); return m != null ? `${m} minutes` : ''; };
+  const text = [
+    `Title: ${Array.isArray(o.name) ? o.name[0] : o.name || ''}`,
+    o.prepTime ? `Prep time: ${minutesText(o.prepTime)}` : '',
+    o.cookTime ? `Cook time: ${minutesText(o.cookTime)}` : '',
+    o.totalTime ? `Total time: ${minutesText(o.totalTime)}` : '',
+    o.recipeYield ? `Makes ${[].concat(o.recipeYield)[0]}` : '',
+    [].concat(o.tool || []).map((t) => (typeof t === 'string' ? t : t.name)).join(', '),
+    'Ingredients', ...[].concat(o.recipeIngredient || o.ingredients || []),
+    'Instructions', ...flattenInstructions(o.recipeInstructions),
+  ].join('\n');
+  const r = parseRecipeText(text, o.name || 'Imported recipe');
+  const cat = [].concat(o.recipeCategory || [])[0];
+  if (cat) {
+    const hit = CATEGORIES.find((c) => new RegExp(c, 'i').test(cat)) || (/(entree|entrée|dinner)/i.test(cat) ? 'Main' : null);
+    if (hit) { r.category = hit; if (r._review) r._review = r._review.filter((f) => f !== 'category'); }
+  }
+  if (r._review && !r._review.length) delete r._review;
+  return r;
+}
+function parseJSONRecipes(data) {
+  const out = [];
+  const visit = (o) => {
+    if (!o) return;
+    if (Array.isArray(o)) return o.forEach(visit);
+    if (typeof o !== 'object') return;
+    const t = o['@type'];
+    if (t === 'Recipe' || (Array.isArray(t) && t.includes('Recipe'))) return void out.push(fromSchemaOrg(o));
+    if (o['@graph']) return visit(o['@graph']);
+    if (o.recipes) return visit(o.recipes);
+    if (o.name && ('passiveTime' in o || typeof o.prepTime === 'number')) return void out.push(normalizeRecipe({ ...o, id: uid() }));
+  };
+  visit(data);
+  return out;
+}
+function parseHTML(html, filename) {
+  const doc = new DOMParser().parseFromString(html, 'text/html');
+  const found = [];
+  doc.querySelectorAll('script[type="application/ld+json"]').forEach((s) => {
+    try { found.push(...parseJSONRecipes(JSON.parse(s.textContent))); } catch {}
+  });
+  if (found.length) return found;
+  return splitAndParse(htmlToText(html), filename);
+}
+function htmlToText(html) {
+  const doc = new DOMParser().parseFromString(html.replace(/<(br|\/p|\/li|\/h\d|\/div|\/tr)[^>]*>/gi, '\n$&'), 'text/html');
+  const ld = [...doc.querySelectorAll('script[type="application/ld+json"]')].map((s) => s.textContent).join('\n');
+  doc.querySelectorAll('script,style,nav,footer,header,noscript,svg').forEach((n) => n.remove());
+  const body = (doc.body ? doc.body.textContent : '').replace(/\n\s*\n\s*\n+/g, '\n\n');
+  return ld ? `Structured recipe data found in the page:\n${ld}\n\nPage text:\n${body}` : body;
+}
+function splitAndParse(text, filename) {
+  return text.split(/\n\s*(?:-{3,}|={3,}|\*{3,})\s*\n/).map((t) => t.trim()).filter((t) => t.length > 10)
+    .map((t) => parseRecipeText(t, filename));
+}
+async function ocrImage(source, onProgress) {
+  await loadScript(LIBS.tesseract);
+  const { data } = await window.Tesseract.recognize(source, 'eng', {
+    logger: (m) => { if (m.status === 'recognizing text') onProgress?.(`Reading text… ${Math.round(m.progress * 100)}%`); },
+  });
+  return data.text || '';
+}
+async function pdfToText(file, onProgress) {
+  await loadScript(LIBS.pdfjs);
+  window.pdfjsLib.GlobalWorkerOptions.workerSrc = LIBS.pdfWorker;
+  const pdf = await window.pdfjsLib.getDocument({ data: await file.arrayBuffer() }).promise;
+  let text = '';
+  for (let p = 1; p <= Math.min(pdf.numPages, 20); p++) {
+    const page = await pdf.getPage(p);
+    const tc = await page.getTextContent();
+    text += tc.items.map((i) => i.str + (i.hasEOL ? '\n' : ' ')).join('') + '\n';
+  }
+  if (text.replace(/\s/g, '').length > 40) return text;
+  // Scanned PDF: rasterize the first pages and OCR them.
+  text = '';
+  for (let p = 1; p <= Math.min(pdf.numPages, 3); p++) {
+    onProgress?.(`Scanned PDF – rendering page ${p}…`);
+    const page = await pdf.getPage(p);
+    const vp = page.getViewport({ scale: 2 });
+    const canvas = document.createElement('canvas');
+    canvas.width = vp.width; canvas.height = vp.height;
+    await page.render({ canvasContext: canvas.getContext('2d'), viewport: vp }).promise;
+    text += (await ocrImage(canvas, onProgress)) + '\n';
+  }
+  return text;
+}
+async function importFile(file, onProgress) {
+  const name = file.name || 'recipe';
+  const ext = (name.split('.').pop() || '').toLowerCase();
+  if (file.type.startsWith('image/') || ['png', 'jpg', 'jpeg', 'webp', 'bmp', 'gif'].includes(ext)) {
+    onProgress?.(`Scanning ${name}…`);
+    return splitAndParse(await ocrImage(file, onProgress), name);
+  }
+  if (ext === 'pdf' || file.type === 'application/pdf') {
+    onProgress?.(`Reading ${name}…`);
+    return splitAndParse(await pdfToText(file, onProgress), name);
+  }
+  const text = await file.text();
+  if (ext === 'json' || /^\s*[\[{]/.test(text)) {
+    try { const r = parseJSONRecipes(JSON.parse(text)); if (r.length) return r; } catch {}
+  }
+  if (ext === 'html' || ext === 'htm' || /<html|<body|application\/ld\+json/i.test(text)) return parseHTML(text, name);
+  return splitAndParse(text, name);
+}
+
+/* ================================================================
+   AI recipe reading
+   Default: the Kitchen Sync server (api/ + lib/server.js on Vercel) calls Claude with the site owner's key.
+   Optional: a visitor's own Anthropic key, called directly from the browser via the official SDK.
+   The prompt + schema below are mirrored in lib/extraction.js – keep them in sync.
+   ================================================================ */
+// Leave empty when this page is deployed together with the api/ folder. If you host the page somewhere else,
+// set it to the Vercel address (e.g. 'https://kitchen-sync.vercel.app') and add the page's origin to the
+// ALLOWED_ORIGINS environment variable in Vercel.
+const AI_SERVER = '';
+const serverAvailable = () => !!AI_SERVER || location.protocol.startsWith('http');
+const AI_MODEL = 'claude-opus-5-5';
+const ANTHROPIC_SDK_URL = 'https://cdn.jsdelivr.net/npm/@anthropic-ai/sdk@0.134.0/+esm';
+let sdkPromise = null;
+const loadAnthropic = () => (sdkPromise ||= import(ANTHROPIC_SDK_URL).then((m) => m.default || m.Anthropic).catch((e) => { sdkPromise = null; throw e; }));
+
+const REVIEWABLE = ['name', 'category', 'prepTime', 'activeTime', 'passiveTime', 'ovenTemp'];
+const minutes = (description) => ({ type: 'integer', description: description + ' Whole minutes; 0 if none.' });
+const AI_SCHEMA = {
+  type: 'object', additionalProperties: false, required: ['recipes'],
+  properties: {
+    recipes: {
+      type: 'array',
+      items: {
+        type: 'object', additionalProperties: false,
+        required: ['name', 'category', 'prepTime', 'waitTime', 'waitLabel', 'activeTime', 'activeOnStove', 'passiveTime', 'passiveWhere',
+          'ovenTemp', 'batches', 'fullOven', 'restTime', 'equipment', 'notes', 'concurrent', 'uncertainFields'],
+        properties: {
+          name: { type: 'string', description: 'Recipe title as written.' },
+          category: { type: 'string', enum: CATEGORIES },
+          prepTime: minutes('Hands-on prep before any cooking or chilling: chopping, measuring, mixing, assembling.'),
+          waitTime: minutes('Hands-off wait BEFORE cooking: chilling dough, rising/proofing, marinating, brining, soaking.'),
+          waitLabel: { type: 'string', description: 'Short label for the wait, e.g. "Chill dough", "Let dough rise", "Marinate". Empty if waitTime is 0.' },
+          activeTime: minutes('Hands-on cooking that needs attention: sautéing, stirring, searing, frying, flipping pancakes, rolling and cutting dough, boiling candy.'),
+          activeOnStove: { type: 'boolean', description: 'True if the active step uses a stovetop burner; false if it is counter work such as rolling or shaping.' },
+          passiveTime: minutes('Unattended cooking for ONE batch: oven bake/roast time (sum all stages, e.g. 15 min at 425°F + 45 min at 350°F = 60), a hands-off simmer, or time to set/chill in the fridge for no-cook dishes. Use the upper end of ranges.'),
+          passiveWhere: { type: 'string', enum: ['oven', 'stovetop', 'counter'], description: 'Where the passive step happens. counter = fridge/counter/no cooking.' },
+          ovenTemp: { type: 'integer', description: 'Oven temperature in °F (convert °C: F = C×9/5+32, round to 5). For multi-stage bakes use the temperature for the longest stage. 0 if no oven.' },
+          batches: { type: 'integer', description: 'Number of sequential oven loads/trays needed (e.g. 3 dozen cookies at 1 dozen per sheet = 3). 1 if everything bakes at once.' },
+          fullOven: { type: 'boolean', description: 'True only if the dish fills the whole oven (e.g. a large turkey).' },
+          restTime: minutes('After cooking and before serving: resting meat, cooling a pie or cookies, setting.'),
+          equipment: { type: 'array', items: { type: 'string' }, description: `Required equipment, using these names where they fit: ${KNOWN_EQUIPMENT.join(', ')}.` },
+          notes: { type: 'string', description: 'Concise ingredient list and key steps (under 900 characters), so the cook can follow along.' },
+          concurrent: { type: 'boolean', description: 'False only if the dish needs the oven to itself or constant attention (e.g. soufflé, candy at hard-crack).' },
+          uncertainFields: { type: 'array', items: { type: 'string', enum: REVIEWABLE }, description: 'Fields you had to guess because the recipe did not state them or the image was unreadable.' },
+        },
+      },
+    },
+  },
+};
+const AI_SYSTEM = `You read recipes (photos, scans, PDFs, web pages, or pasted text) and convert them into timing data for Kitchen Sync, a scheduler that plans several dishes around shared ovens, burners and one cook's hands.
+
+Split each recipe's time into: prep → wait (hands-off before cooking) → active (hands-on cooking) → passive (unattended oven/simmer/set) → rest. These must not overlap or double count: if a recipe states "Cook time 1 hr" and 10 minutes of that is sautéing before a 50-minute bake, active is 10 and passive is 50. Read the instructions, not just the header times, because header times are often wrong or lumped together. If a time is not stated, estimate it as an experienced cook would and list the field in uncertainFields.
+
+Return one entry per distinct recipe in the input; if the input has several recipes (e.g. a cookbook page), return them all. If there is no recipe at all, return an empty list.`;
+
+function blobToBase64(blob) {
+  return new Promise((resolve, reject) => {
+    const fr = new FileReader();
+    fr.onload = () => resolve(String(fr.result).split(',')[1]);
+    fr.onerror = () => reject(fr.error);
+    fr.readAsDataURL(blob);
+  });
+}
+/* Normalize any browser-readable image to a JPEG ≤ 2000px on the long edge (keeps requests small, text legible). */
+async function imageToJpeg(file) {
+  const url = URL.createObjectURL(file);
+  try {
+    const img = await new Promise((resolve, reject) => {
+      const i = new Image();
+      i.onload = () => resolve(i);
+      i.onerror = () => reject(new Error(`This browser can't open ${file.name} – try saving it as JPG or PNG.`));
+      i.src = url;
+    });
+    const scale = Math.min(1, 2000 / Math.max(img.naturalWidth, img.naturalHeight));
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.round(img.naturalWidth * scale);
+    canvas.height = Math.round(img.naturalHeight * scale);
+    const g = canvas.getContext('2d');
+    g.fillStyle = '#fff'; g.fillRect(0, 0, canvas.width, canvas.height);
+    g.drawImage(img, 0, 0, canvas.width, canvas.height);
+    const blob = await new Promise((r) => canvas.toBlob(r, 'image/jpeg', 0.9));
+    return blobToBase64(blob);
+  } finally { URL.revokeObjectURL(url); }
+}
+async function fileToContentBlocks(file) {
+  const name = file.name || 'recipe';
+  const ext = (name.split('.').pop() || '').toLowerCase();
+  if (file.type.startsWith('image/') || ['png', 'jpg', 'jpeg', 'webp', 'bmp', 'gif', 'heic'].includes(ext)) {
+    return [{ type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: await imageToJpeg(file) } }];
+  }
+  if (ext === 'pdf' || file.type === 'application/pdf') {
+    if (file.size > 30 * 1024 * 1024) throw new Error(`${name} is over 30 MB – split it into smaller PDFs.`);
+    return [{ type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: await blobToBase64(file) } }];
+  }
+  let text = await file.text();
+  if (ext === 'html' || ext === 'htm' || /<html|<body/i.test(text)) text = htmlToText(text);
+  if (text.length > 400000) throw new Error(`${name} is too long for one request (${Math.round(text.length / 1000)}k characters) – split it into smaller files.`);
+  return [{ type: 'text', text: `File "${name}":\n\n${text}` }];
+}
+
+function recipesFromAI(list) {
+  return (list || []).map((r) => {
+    const { uncertainFields = [], ...rest } = r;
+    const recipe = normalizeRecipe({ ...rest, id: uid(), waitLabel: rest.waitLabel || 'Chill / rise' });
+    const review = uncertainFields.filter((f) => REVIEWABLE.includes(f));
+    if (review.length) recipe._review = [...new Set(review)];
+    return recipe;
+  });
+}
+async function fetchAIStatus() {
+  if (!serverAvailable()) return { enabled: false };
+  try {
+    const res = await fetch(`${AI_SERVER}/api/ai-status`, { cache: 'no-store' });
+    return res.ok ? await res.json() : { enabled: false };
+  } catch { return { enabled: false }; }
+}
+async function extractViaServer(blocks) {
+  const body = JSON.stringify({ blocks });
+  if (body.length > 4_400_000) throw new Error('That file is too large for AI reading (about 3 MB max) – split the PDF or use a smaller photo.');
+  let res;
+  try {
+    res = await fetch(`${AI_SERVER}/api/extract-recipes`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body });
+  } catch { throw new Error('Could not reach the Kitchen Sync server – check your internet connection.'); }
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const err = new Error(data.error || `Server error ${res.status}`);
+    err.fatal = res.status === 429 || res.status === 503;
+    err.remaining = data.code === 'quota' ? 0 : undefined;
+    throw err;
+  }
+  return { recipes: recipesFromAI(data.recipes), remaining: data.remaining };
+}
+async function extractWithKey(blocks, apiKey) {
+  const Anthropic = await loadAnthropic();
+  const client = new Anthropic({ apiKey, dangerouslyAllowBrowser: true, maxRetries: 2 });
+  let res;
+  try {
+    res = await client.beta.messages.create({
+      model: AI_MODEL,
+      max_tokens: 16000,
+      betas: ['server-side-fallback-2026-07-01'],
+      fallbacks: 'default',
+      output_config: { effort: 'medium', format: { type: 'json_schema', schema: AI_SCHEMA } },
+      system: AI_SYSTEM,
+      messages: [{ role: 'user', content: [...blocks, { type: 'text', text: 'Extract every recipe in this input for the Kitchen Sync scheduler.' }] }],
+    });
+  } catch (e) {
+    const err = new Error(
+      e instanceof Anthropic.AuthenticationError ? 'Your Anthropic API key was rejected – check it in AI settings.'
+      : e instanceof Anthropic.PermissionDeniedError ? 'This API key is not allowed to use Claude Opus 5.5.'
+      : e instanceof Anthropic.RateLimitError ? 'Rate limit reached – wait a minute and try again.'
+      : e instanceof Anthropic.BadRequestError ? `Claude couldn't accept this file: ${e.message}`
+      : e instanceof Anthropic.APIConnectionError ? 'Could not reach Anthropic – check your internet connection.'
+      : e instanceof Anthropic.APIError ? `Anthropic API error ${e.status}: ${e.message}`
+      : e.message || String(e));
+    err.fatal = e instanceof Anthropic.AuthenticationError || e instanceof Anthropic.PermissionDeniedError;
+    throw err;
+  }
+  if (res.stop_reason === 'refusal') throw new Error('Claude declined to read this file.');
+  if (res.stop_reason === 'max_tokens') throw new Error('The file has too many recipes for one pass – split it up.');
+  const text = res.content.filter((b) => b.type === 'text').map((b) => b.text).join('');
+  let data;
+  try { data = JSON.parse(text); } catch { throw new Error('Claude returned an unreadable answer – try again.'); }
+  return { recipes: recipesFromAI(data.recipes) };
+}
+/* A visitor's own key wins; otherwise the server is used. */
+const aiExtract = (blocks, apiKey) => (apiKey ? extractWithKey(blocks, apiKey) : extractViaServer(blocks));
+const aiReadFile = async (file, apiKey) => aiExtract(await fileToContentBlocks(file), apiKey);
+const aiReadText = (text, apiKey) => aiExtract([{ type: 'text', text }], apiKey);
+
+/* ================================================================
+   Scheduler
+   ================================================================ */
+function peakLoad(ivs, s, e) {
+  const pts = [];
+  for (const iv of ivs) if (iv.s < e && iv.e > s) pts.push([Math.max(iv.s, s), iv.w], [Math.min(iv.e, e), -iv.w]);
+  pts.sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+  let cur = 0, peak = 0;
+  for (const [, w] of pts) { cur += w; if (cur > peak) peak = cur; }
+  return peak;
+}
+
+/* Turn a recipe into ordered stages of tasks: prep → wait → active → passive (batches in parallel). Rest is attached after. */
+function buildStages(r, settings) {
+  const groups = { prep: [], handson: [], stove: [], bake: [] };
+  for (const nm of r.equipment) { const g = equipGroup(nm); if (groups[g]) groups[g].push(nm); }
+  const passiveKind = r.passiveTime > 0 ? (r.passiveWhere === 'oven' ? 'bake' : r.passiveWhere === 'stovetop' ? 'simmer' : 'hold') : null;
+  const has = { prep: r.prepTime > 0, active: r.activeTime > 0, passive: !!passiveKind };
+  const eq = { prep: [], active: [], passive: [] };
+  const assign = (names, order) => names.forEach((nm) => { const k = order.find((x) => has[x]); if (k) eq[k].push(nm); });
+  groups.stove.forEach((nm) => {
+    let used = false;
+    if (has.active && r.activeOnStove) { eq.active.push(nm); used = true; }
+    if (passiveKind === 'simmer') { eq.passive.push(nm); used = true; }
+    if (!used) assign([nm], ['active', 'passive', 'prep']);
+  });
+  assign(groups.prep, ['prep', 'active', 'passive']);
+  assign(groups.handson, ['active', 'prep']);
+  assign(groups.bake, passiveKind === 'bake' || passiveKind === 'hold' ? ['passive', 'active'] : ['active', 'prep']);
+
+  const base = { recipeId: r.id, exclusive: !r.concurrent };
+  const stages = [];
+  if (r.prepTime) stages.push([{ ...base, id: `${r.id}-prep-1`, kind: 'prep', dur: r.prepTime, hands: true, equip: eq.prep }]);
+  if (r.waitTime) stages.push([{ ...base, id: `${r.id}-wait-1`, kind: 'wait', dur: r.waitTime, equip: [] }]);
+  if (r.activeTime) stages.push([{ ...base, id: `${r.id}-active-1`, kind: 'active', dur: r.activeTime, hands: true, burner: r.activeOnStove, equip: eq.active }]);
+  if (passiveKind) {
+    const n = passiveKind === 'hold' ? 1 : r.batches;
+    stages.push(Array.from({ length: n }, (_, i) => ({
+      ...base, id: `${r.id}-${passiveKind}-${i + 1}`, kind: passiveKind, dur: r.passiveTime, batch: i + 1, batches: n,
+      oven: passiveKind === 'bake', temp: r.ovenTemp, racks: r.fullOven ? settings.racks : 1,
+      burner: passiveKind === 'simmer', equip: eq.passive,
+    })));
+  }
+  return { stages, rest: r.restTime };
+}
+
+function makeEngine(settings, sp, lowerBound) {
+  const placed = [];
+  const iv = (p, w = 1, pad = 0) => ({ s: p.start, e: p.end + pad, w });
+
+  function check(task, s, e, oven, temp) {
+    if (lowerBound != null && s < lowerBound) return false;
+    if (task.hands) {
+      const b = sp.cookBuffer;
+      const ov = placed.filter((p) => p.hands && p.start < e + b && p.end + b > s);
+      if (ov.length && (task.exclusive || ov.some((p) => p.exclusive))) return false;
+      if (peakLoad(ov.map((p) => iv(p, 1, b)), s, e + b) + 1 > settings.cooks) return false;
+    }
+    if (task.burner) {
+      const ov = placed.filter((p) => p.burner && p.start < e && p.end > s);
+      if (peakLoad(ov.map((p) => iv(p)), s, e) + 1 > settings.burners) return false;
+    }
+    for (const nm of task.equip || []) {
+      const key = nm.toLowerCase();
+      const ov = placed.filter((p) => p.start < e && p.end > s && (p.equip || []).some((x) => x.toLowerCase() === key));
+      if (peakLoad(ov.map((p) => iv(p)), s, e) + 1 > eqCount(settings, nm)) return false;
+    }
+    if (task.oven) {
+      const occ = placed.filter((p) => p.oven === oven);
+      let hotBefore = false;
+      for (const p of occ) {
+        if (p.start < e && p.end > s) {
+          if (!sp.share || task.exclusive || p.exclusive || p.temp !== temp) return false;
+          if (p.start <= s) hotBefore = true;
+        } else if (p.end <= s) {
+          hotBefore = true;
+          if (s - p.end < transMin(p.temp, temp) + sp.ovenBuffer) return false;
+        } else if (p.start - e < transMin(temp, p.temp) + sp.ovenBuffer) return false;
+      }
+      const ovl = occ.filter((p) => p.start < e && p.end > s);
+      if (peakLoad(ovl.map((p) => iv(p, p.racks)), s, e) + task.racks > settings.racks) return false;
+      if (!hotBefore && lowerBound != null && s - transMin(AMBIENT, temp) < lowerBound) return false;
+    }
+    return true;
+  }
+
+  function candidates(task, s0, dir) {
+    if (!task.oven) return [{ oven: null, temp: null, dur: task.dur }];
+    const list = [];
+    for (let o = 0; o < settings.ovens; o++) list.push({ oven: o, temp: task.temp, dur: task.dur });
+    if (sp.share && sp.tolerance > 0 && !task.exclusive) {
+      const seen = new Set();
+      for (const p of placed) {
+        if (p.oven == null || p.exclusive || p.temp === task.temp || Math.abs(p.temp - task.temp) > sp.tolerance) continue;
+        const k = p.oven + ':' + p.temp;
+        if (seen.has(k)) continue;
+        seen.add(k);
+        list.push({ oven: p.oven, temp: p.temp, dur: adjDur(task.dur, task.temp, p.temp), adjusted: true });
+      }
+    }
+    return list;
+  }
+
+  const commit = (task, fields) => { const p = { ...task, ...fields }; placed.push(p); return p; };
+
+  function place(task, bound, dir) {
+    const free = !task.hands && !task.burner && !task.oven && !(task.equip || []).length;
+    if (free) { const s = dir > 0 ? bound : bound - task.dur; return commit(task, { start: s, end: s + task.dur }); }
+    const start = dir > 0 ? ceilTo(bound) : floorTo(bound);
+    const cands = candidates(task);
+    for (let k = 0; k <= 864; k++) {           // search up to 3 days in 5-min steps
+      const a = start + dir * k * 5;
+      for (const c of cands) {
+        const s = dir > 0 ? a : a - c.dur, e = s + c.dur;
+        if (c.adjusted && !placed.some((p) => p.oven === c.oven && p.temp === c.temp && p.start < e && p.end > s)) continue;
+        if (check(task, s, e, c.oven, c.temp)) {
+          return commit(task, { start: s, end: e, dur: c.dur, oven: c.oven, temp: c.temp, adjusted: c.adjusted ? { fromTemp: task.temp, fromDur: task.dur } : null });
+        }
+      }
+    }
+    return null;
+  }
+  return { placed, place, addFree: (task, start) => commit(task, { start, end: start + task.dur }) };
+}
+
+function scheduleAll(recipes, settings, sp, dir, bound) {
+  const eng = makeEngine(settings, sp, dir > 0 ? bound : null);
+  const order = [...recipes].sort((a, b) => chainLen(b) - chainLen(a) || isOvenRecipe(b) - isOvenRecipe(a));
+  const ready = {}, failures = [];
+  for (const r of order) {
+    const { stages, rest } = buildStages(r, settings);
+    let restStart;
+    if (dir > 0) {
+      let b = bound;
+      for (const st of stages) {
+        let mx = b;
+        for (const t of st) {
+          const p = eng.place(t, b, 1);
+          if (!p) { failures.push({ recipe: r, task: t }); continue; }
+          mx = Math.max(mx, p.end);
+        }
+        b = mx;
+      }
+      restStart = b;
+    } else {
+      let b = bound - rest;
+      restStart = null;
+      for (let i = stages.length - 1; i >= 0; i--) {
+        let mn = b;
+        for (const t of stages[i]) {
+          const p = eng.place(t, b, -1);
+          if (!p) { failures.push({ recipe: r, task: t }); continue; }
+          mn = Math.min(mn, p.start);
+          if (i === stages.length - 1) restStart = Math.max(restStart ?? -Infinity, p.end);
+        }
+        b = mn;
+      }
+      if (restStart == null) restStart = bound - rest;
+    }
+    if (rest) eng.addFree({ id: `${r.id}-rest-1`, recipeId: r.id, kind: 'rest', dur: rest, equip: [] }, restStart);
+    ready[r.id] = restStart + rest;
+  }
+  const readyVals = Object.values(ready);
+  return { placements: eng.placed, ready, failures, order: order.map((r) => r.id), readyMax: readyVals.length ? Math.max(...readyVals) : bound };
+}
+
+/* Derive what each oven is doing between bakes: preheat, raise, lower, off. */
+function ovenTimeline(placements, settings) {
+  const segs = [];
+  for (let o = 0; o < settings.ovens; o++) {
+    const occ = placements.filter((p) => p.oven === o).sort((a, b) => a.start - b.start);
+    let st = { on: false, temp: AMBIENT, until: -Infinity };
+    for (const p of occ) {
+      if (st.on && p.start < st.until && p.temp === st.temp) { st.until = Math.max(st.until, p.end); continue; }
+      const gap = p.start - st.until;
+      if (st.on && gap > 60 + transMin(AMBIENT, p.temp)) { segs.push({ type: 'off', oven: o, start: st.until, end: st.until }); st.on = false; }
+      if (!st.on) {
+        const d = transMin(AMBIENT, p.temp);
+        segs.push({ type: 'preheat', oven: o, start: p.start - d, end: p.start, from: AMBIENT, to: p.temp });
+      } else if (p.temp !== st.temp) {
+        const d = transMin(st.temp, p.temp);
+        if (p.temp > st.temp) segs.push({ type: 'raise', oven: o, start: p.start - d, end: p.start, from: st.temp, to: p.temp });
+        else segs.push({ type: 'lower', oven: o, start: st.until, end: Math.min(p.start, st.until + d), from: st.temp, to: p.temp });
+      }
+      st = { on: true, temp: p.temp, until: Math.max(p.end, st.on && st.temp === p.temp ? st.until : -Infinity) };
+    }
+    if (st.on) segs.push({ type: 'off', oven: o, start: st.until, end: st.until });
+  }
+  return segs;
+}
+
+function idealOvenConflicts(recipes, settings, sp, dir) {
+  const wins = recipes.filter(isOvenRecipe).map((r) => {
+    const rounds = Math.ceil(r.batches / (r.fullOven ? 1 : settings.racks));
+    const len = r.passiveTime * rounds;
+    const s = dir < 0 ? -r.restTime - len : r.prepTime + r.waitTime + r.activeTime;
+    return { r, s, e: s + len, T: r.ovenTemp };
+  });
+  const out = [];
+  for (let i = 0; i < wins.length; i++) for (let j = i + 1; j < wins.length; j++) {
+    const a = wins[i], b = wins[j];
+    const diff = Math.abs(a.T - b.T);
+    if (diff <= sp.tolerance) continue;
+    const os = Math.max(a.s, b.s), oe = Math.min(a.e, b.e);
+    if (oe <= os) continue;
+    const temps = wins.filter((w) => w.s < oe && w.e > os).map((w) => w.T).sort((x, y) => x - y);
+    let clusters = 0, last = -Infinity;
+    for (const t of temps) if (t - last > sp.tolerance) { clusters++; last = t; }
+    if (clusters > settings.ovens) out.push({ a: a.r, b: b.r, diff, key: [a.r.id, b.r.id, a.T, b.T, settings.ovens].join('|') });
+  }
+  return out;
+}
+
+function generatePlan(recipesIn, settings) {
+  const recipes = recipesIn.map(normalizeRecipe);
+  const sp = stratParams(settings);
+  const anchor = fromLocalInput(settings.time) || new Date();
+  const byId = Object.fromEntries(recipes.map((r) => [r.id, r]));
+  let run, serveAt, synced = false;
+
+  if (settings.anchor === 'target') {
+    run = scheduleAll(recipes, settings, sp, -1, 0);
+    serveAt = 0;
+  } else {
+    const fwd = scheduleAll(recipes, settings, sp, 1, 0);
+    run = fwd;
+    if (!fwd.failures.length && recipes.length > 1) {
+      // Try a "synchronized finish": schedule backwards from the forward finish so dishes land together.
+      const sync = scheduleAll(recipes, settings, sp, -1, fwd.readyMax);
+      if (!sync.failures.length) {
+        const segs = ovenTimeline(sync.placements, settings);
+        const minT = Math.min(...sync.placements.map((p) => p.start), ...segs.map((s) => s.start));
+        sync.placements.forEach((p) => { p.start -= minT; p.end -= minT; });
+        Object.keys(sync.ready).forEach((k) => (sync.ready[k] -= minT));
+        sync.readyMax -= minT;
+        if (sync.readyMax <= fwd.readyMax + (settings.strategy === 'chill' ? 20 : 0)) { run = sync; synced = true; }
+      }
+    }
+    serveAt = run.readyMax;
+  }
+
+  const placements = run.placements.sort((a, b) => a.start - b.start);
+  const segs = ovenTimeline(placements, settings);
+  const t0 = Math.min(serveAt, ...placements.map((p) => p.start), ...segs.map((s) => s.start));
+  const t1 = Math.max(serveAt, ...placements.map((p) => p.end));
+  const serveDay = atMin(anchor, serveAt);
+  const T = (m) => fmtAt(anchor, m, serveDay);
+
+  /* ---------- checklist events ---------- */
+  const events = [];
+  const ev = (id, t, kind, text, detail = '', recipeId = null, order = 5) => events.push({ id, t, kind, text, detail, recipeId, order });
+  for (const s of segs) {
+    const o = `Oven ${s.oven + 1}`;
+    if (s.type === 'preheat') ev(`ov${s.oven}-pre-${s.start}`, s.start, 'oven', `Preheat ${o} to ${s.to}°F`, `About ${fmtDur(s.end - s.start)} to come to temperature.`, null, 0);
+    if (s.type === 'raise') ev(`ov${s.oven}-up-${s.start}`, s.start, 'oven', `Raise ${o} to ${s.to}°F`, `From ${s.from}°F – allow ~${fmtDur(s.end - s.start)}.`, null, 0);
+    if (s.type === 'lower') ev(`ov${s.oven}-down-${s.start}`, s.start, 'oven', `Lower ${o} to ${s.to}°F`, `Crack the door for a few minutes to cool from ${s.from}°F faster (~${fmtDur(transMin(s.from, s.to))}).`, null, 1);
+    if (s.type === 'off') ev(`ov${s.oven}-off-${s.start}`, s.start, 'oven', `Turn off ${o}`, '', null, 9);
+  }
+  for (const p of placements) {
+    const r = byId[p.recipeId];
+    const nm = r.name || 'Untitled';
+    const batch = p.batches > 1 ? ` (batch ${p.batch} of ${p.batches})` : '';
+    const eqTxt = (p.equip || []).length ? `Use: ${p.equip.join(', ')}. ` : '';
+    const firstNote = (r.notes || '').split(/(?<=[.!?])\s/)[0].slice(0, 180);
+    if (p.kind === 'prep') ev(`${p.id}:s`, p.start, 'prep', `Prep ${nm}`, `${eqTxt}${fmtDur(p.dur)} hands-on. ${firstNote}`, r.id, 3);
+    if (p.kind === 'wait') ev(`${p.id}:s`, p.start, 'wait', `${r.waitLabel || 'Chill / rise'}: ${nm}`, `Hands-off for ${fmtDur(p.dur)}.`, r.id, 4);
+    if (p.kind === 'active') ev(`${p.id}:s`, p.start, 'active', p.burner ? `Cook ${nm} on the stovetop` : `Hands-on: shape / assemble ${nm}`, `${eqTxt}${fmtDur(p.dur)} of active work.`, r.id, 3);
+    if (p.kind === 'bake') {
+      const adj = p.adjusted ? ` Sharing the oven at ${p.temp}°F (recipe says ${p.adjusted.fromTemp}°F) – time adjusted ${p.adjusted.fromDur} → ${p.dur} min; check for doneness early.` : '';
+      ev(`${p.id}:s`, p.start, 'bake', `Put ${nm}${batch} in Oven ${p.oven + 1} at ${p.temp}°F`, `Set a timer for ${fmtDur(p.dur)}. ${eqTxt}${adj}`, r.id, 2);
+      ev(`${p.id}:e`, p.end, 'bake', `Take ${nm}${batch} out of Oven ${p.oven + 1}`, '', r.id, 1);
+    }
+    if (p.kind === 'simmer') {
+      ev(`${p.id}:s`, p.start, 'simmer', `Simmer ${nm}${batch} on a burner`, `Set a timer for ${fmtDur(p.dur)}. ${eqTxt}`, r.id, 2);
+      ev(`${p.id}:e`, p.end, 'simmer', `Take ${nm}${batch} off the heat`, '', r.id, 1);
+    }
+    if (p.kind === 'hold') ev(`${p.id}:s`, p.start, 'hold', `${nm}: hands-off to set / chill`, `${fmtDur(p.dur)}. ${eqTxt}`, r.id, 4);
+    if (p.kind === 'rest') ev(`${p.id}:s`, p.start, 'rest', `Rest / cool ${nm}`, `${fmtDur(p.dur)} – tent or leave on a rack.`, r.id, 2);
+  }
+  for (const r of recipes) {
+    const at = run.ready[r.id];
+    const early = serveAt - at;
+    ev(`${r.id}:ready`, at, 'ready', `${r.name || 'Untitled'} is ready`,
+      early > 15 ? (r.category === 'Dessert' || r.restTime >= 60 ? `Made ahead – set aside until serving (${fmtDur(early)}).` : `Ready ${fmtDur(early)} before serving – keep covered / warm.`) : '', r.id, 6);
+  }
+  // Breaks: gaps in hands-on work (Chill mode emphasizes them).
+  const hands = placements.filter((p) => p.hands).sort((a, b) => a.start - b.start);
+  let lastEnd = null;
+  for (const p of hands) {
+    if (lastEnd != null && p.start - lastEnd >= (settings.strategy === 'chill' ? 15 : 30)) {
+      ev(`break-${lastEnd}`, lastEnd, 'break', 'Break – nothing hands-on', `Free until ${T(p.start)} (${fmtDur(p.start - lastEnd)}). ${settings.strategy === 'chill' ? 'Tidy up, refill your drink, put your feet up.' : 'Good time to wash up and set the table.'}`, null, 7);
+    }
+    lastEnd = Math.max(lastEnd ?? -Infinity, p.end);
+  }
+  ev('serve', serveAt, 'serve', settings.anchor === 'target' ? 'Serve! Everything is on the table' : 'Everything is ready – serve!', '', null, 8);
+  events.sort((a, b) => a.t - b.t || a.order - b.order);
+
+  /* ---------- alerts: conflicts, adjustments, warnings ---------- */
+  const alerts = [];
+  for (const f of run.failures) alerts.push({ id: `fail-${f.task.id}`, severity: 'error', title: `Couldn't fit “${f.recipe.name}” (${f.task.kind})`, body: 'No slot found within 3 days – check ovens, burners and equipment counts in Kitchen Setup.' });
+  const bakesOf = (id) => placements.filter((p) => p.recipeId === id && p.kind === 'bake');
+  const spanTxt = (ps) => ps.length ? `${T(Math.min(...ps.map((p) => p.start)))}–${T(Math.max(...ps.map((p) => p.end)))} in Oven ${[...new Set(ps.map((p) => p.oven + 1))].join(' & ')}` : 'n/a';
+  for (const c of idealOvenConflicts(recipes, settings, sp, settings.anchor === 'target' ? -1 : 1)) {
+    const [hot, cool] = c.a.ovenTemp >= c.b.ovenTemp ? [c.a, c.b] : [c.b, c.a];
+    const firstStart = (r) => Math.min(...bakesOf(r.id).map((p) => p.start), Infinity);
+    const orderTip = firstStart(cool) <= firstStart(hot)
+      ? `${cool.name} goes first because ovens heat up faster than they cool down.`
+      : `${hot.name} goes first (it ${hot.restTime >= 60 ? 'needs time to cool' : 'fits better that way'}); allow ~${fmtDur(transMin(hot.ovenTemp, cool.ovenTemp))} for the oven to drop to ${cool.ovenTemp}°F.`;
+    const actions = [];
+    if (c.diff <= 75) {
+      const mid = Math.round((c.a.ovenTemp + c.b.ovenTemp) / 2 / 25) * 25;
+      const da = adjDur(c.a.passiveTime, c.a.ovenTemp, mid), db = adjDur(c.b.passiveTime, c.b.ovenTemp, mid);
+      actions.push({ label: `Bake both at ${mid}°F`, hint: `${c.a.name} ${c.a.passiveTime}→${da} min · ${c.b.name} ${c.b.passiveTime}→${db} min`, action: { type: 'compromise', ids: [c.a.id, c.b.id], temp: mid } });
+    }
+    if (settings.strategy === 'chill' && c.diff <= 25) actions.push({ label: 'Switch to Express mode', hint: 'Lets dishes within 25°F share an oven', action: { type: 'express' } });
+    if (settings.ovens < 4) actions.push({ label: 'I have another oven', hint: 'Countertop / toaster oven counts too', action: { type: 'addOven' } });
+    alerts.push({
+      id: 'conf-' + c.key, severity: c.diff >= 75 ? 'warning' : 'conflict',
+      title: `${c.a.name} (${c.a.ovenTemp}°F) and ${c.b.name} (${c.b.ovenTemp}°F) want the oven at the same time`,
+      body: `They're ${c.diff}°F apart${c.diff >= 75 ? ' – too far to share' : ''}. Kitchen Sync staggered them: ${c.a.name} ${spanTxt(bakesOf(c.a.id))}; ${c.b.name} ${spanTxt(bakesOf(c.b.id))}. ${orderTip}`,
+      actions,
+    });
+  }
+  for (const p of placements.filter((x) => x.adjusted)) {
+    alerts.push({ id: 'adj-' + p.id, severity: 'info', title: `${byId[p.recipeId].name} shares Oven ${p.oven + 1} at ${p.temp}°F`,
+      body: `Recipe calls for ${p.adjusted.fromTemp}°F; baking at ${p.temp}°F alongside another dish, so time goes ${p.adjusted.fromDur} → ${p.dur} min${p.batches > 1 ? ` (batch ${p.batch})` : ''}. Check doneness a few minutes early.` });
+  }
+  if (settings.anchor === 'target') {
+    for (const r of recipes) {
+      const early = serveAt - run.ready[r.id];
+      if (early > 30 && r.category !== 'Dessert' && r.restTime < 60) {
+        alerts.push({ id: 'early-' + r.id, severity: 'warning', title: `${r.name} will be ready ${fmtDur(early)} early`,
+          body: `Equipment or oven space forced it earlier. Keep it covered and warm, or reheat 10–15 min before serving.`,
+          actions: settings.ovens < 4 && isOvenRecipe(r) ? [{ label: 'I have another oven', hint: 'Re-plan with one more oven', action: { type: 'addOven' } }] : [] });
+      }
+    }
+  }
+  const eqUse = {};
+  recipes.forEach((r) => r.equipment.forEach((n) => { if (equipGroup(n) !== 'tool') (eqUse[n.toLowerCase()] ||= { name: n, users: [] }).users.push(r.name); }));
+  Object.values(eqUse).forEach((u) => {
+    const cap = eqCount(settings, u.name);
+    if (u.users.length > cap) alerts.push({ id: 'eq-' + u.name, severity: 'info', title: `${u.name} is shared by ${u.users.length} recipes (you have ${cap})`, body: `${u.users.join(', ')} – Kitchen Sync makes sure they never need it at the same time. Add more in Kitchen Setup if you own extras.` });
+  });
+  if (synced) alerts.push({ id: 'sync', severity: 'info', title: 'Synchronized finish', body: 'Dishes were scheduled so they finish together instead of sitting around after an early start.' });
+  if (t1 - t0 > 16 * 60) alerts.push({ id: 'long', severity: 'info', title: `This plan spans ${fmtDur(t1 - t0)}`, body: 'Consider making long-resting items (pies, doughs) the day before.' });
+
+  /* ---------- Gantt rows ---------- */
+  const rows = [];
+  const order = run.order;
+  order.forEach((id, idx) => {
+    const r = byId[id];
+    const items = placements.filter((p) => p.recipeId === id).map((p) => ({
+      start: p.start, end: p.end, kind: p.kind, adjusted: !!p.adjusted,
+      label: p.kind === 'bake' ? `${p.temp}°${p.batches > 1 ? ` #${p.batch}` : ''}` : p.kind === 'simmer' && p.batches > 1 ? `#${p.batch}` : PHASES[p.kind].label,
+      tip: `${r.name} – ${PHASES[p.kind].label}${p.batches > 1 ? ` (batch ${p.batch})` : ''}: ${T(p.start)}–${T(p.end)}${p.oven != null ? ` · Oven ${p.oven + 1} @ ${p.temp}°F` : ''}`,
+    }));
+    if (run.ready[id] < serveAt - 5) items.push({ start: run.ready[id], end: serveAt, kind: 'warm', label: 'Hold', tip: `${r.name} – waiting ${fmtDur(serveAt - run.ready[id])} until serving` });
+    rows.push({ key: id, label: r.name || 'Untitled', sub: r.category, color: RECIPE_COLORS[recipes.indexOf(r) % RECIPE_COLORS.length], items });
+  });
+  for (let o = 0; o < settings.ovens; o++) {
+    const items = placements.filter((p) => p.oven === o).map((p) => ({
+      start: p.start, end: p.end, kind: 'bake', adjusted: !!p.adjusted, label: `${byId[p.recipeId].name} ${p.temp}°`,
+      tip: `Oven ${o + 1}: ${byId[p.recipeId].name} @ ${p.temp}°F, ${T(p.start)}–${T(p.end)}`,
+    }));
+    segs.filter((s) => s.oven === o && s.type !== 'off').forEach((s) => items.push({
+      start: s.start, end: s.end, kind: 'preheat', label: `→${s.to}°`, tip: `Oven ${o + 1}: ${s.type} ${s.from}°F → ${s.to}°F, ${T(s.start)}–${T(s.end)}`,
+    }));
+    rows.push({ key: 'oven' + o, label: `Oven ${o + 1}`, sub: `${settings.racks} rack${settings.racks > 1 ? 's' : ''}`, lane: true, items });
+  }
+  rows.push({ key: 'serve', label: 'Serve', sub: T(serveAt), lane: true, items: [{ start: serveAt, end: serveAt + 20, kind: 'serve', label: 'Serve', tip: `Serve at ${T(serveAt)}` }] });
+  rows.forEach((row) => {        // pack overlapping bars into sub-lanes
+    const ends = [];
+    row.items.sort((a, b) => a.start - b.start).forEach((it) => {
+      let l = ends.findIndex((e) => e <= it.start);
+      if (l < 0) { l = ends.length; ends.push(0); }
+      ends[l] = it.end; it.lane = l;
+    });
+    row.lanes = Math.max(1, ends.length);
+  });
+
+  const handsOn = placements.filter((p) => p.hands).reduce((s, p) => s + p.dur, 0);
+  const ovenMin = placements.filter((p) => p.kind === 'bake').reduce((s, p) => s + p.dur, 0);
+  return {
+    createdAt: Date.now(), base: anchor.getTime(), serveAt, t0, t1, placements, segs, events, alerts, rows,
+    recipes: byId, order, anchorMode: settings.anchor, strategy: settings.strategy,
+    settings: { ovens: settings.ovens, racks: settings.racks, burners: settings.burners, cooks: settings.cooks },
+    stats: { start: t0, end: serveAt, total: serveAt - t0, handsOn, ovenMin, steps: events.length },
+  };
+}
+
+/* ================================================================
+   Validation → clarifying questions
+   ================================================================ */
+const REVIEW_Q = {
+  name: (r) => ({ q: `What should we call this recipe?`, input: 'text', field: 'name', value: r.name }),
+  prepTime: (r) => ({ q: `How many minutes of prep (chopping, mixing) does “${r.name}” need?`, input: 'number', field: 'prepTime', unit: 'min', value: r.prepTime || 15 }),
+  passiveTime: (r) => ({ q: `How long does “${r.name}” bake / cook unattended?`, input: 'number', field: 'passiveTime', unit: 'min', value: r.passiveTime || 30 }),
+  activeTime: (r) => ({ q: `How many minutes of hands-on stovetop cooking for “${r.name}”?`, input: 'number', field: 'activeTime', unit: 'min', value: r.activeTime || 15 }),
+  ovenTemp: (r) => ({ q: `What oven temperature does “${r.name}” need?`, input: 'number', field: 'ovenTemp', unit: '°F', value: r.ovenTemp || 350 }),
+  category: (r) => ({ q: `What kind of dish is “${r.name}”?`, input: 'select', options: CATEGORIES, field: 'category', value: r.category === 'Other' ? 'Side' : r.category }),
+};
+function reviewQuestions(recipes) {
+  const qs = [];
+  for (const r of recipes) for (const f of r._review || []) {
+    if (REVIEW_Q[f]) qs.push({ key: `${r.id}.${f}`, recipeId: r.id, severity: 'review', ...REVIEW_Q[f](r) });
+  }
+  return qs;
+}
+function validate(recipes, settings, dismissed = []) {
+  const qs = [];
+  const add = (q) => qs.push(q);
+  if (!fromLocalInput(settings.time)) add({ key: 'time', severity: 'error', q: settings.anchor === 'target' ? 'When do you want to serve?' : 'When do you want to start cooking?', input: 'datetime', field: 'time', value: toLocalInput(new Date()) });
+  for (const r0 of recipes) {
+    const r = normalizeRecipe(r0);
+    const nm = r.name || 'this recipe';
+    if (!r.name.trim()) add({ key: `${r.id}.name`, recipeId: r.id, severity: 'error', q: 'One recipe has no name – what is it?', input: 'text', field: 'name', value: 'Untitled dish' });
+    if (r.prepTime + r.waitTime + r.activeTime + r.passiveTime + r.restTime === 0) add({ key: `${r.id}.prep0`, recipeId: r.id, severity: 'error', q: `“${nm}” has no times at all. How many minutes of prep?`, input: 'number', field: 'prepTime', unit: 'min', value: 15 });
+    if (r.passiveWhere === 'oven' && r.passiveTime > 0 && !r.ovenTemp) add({ key: `${r.id}.temp`, recipeId: r.id, severity: 'error', q: `What oven temperature does “${nm}” bake at?`, input: 'number', field: 'ovenTemp', unit: '°F', value: 350 });
+    if (r.passiveWhere === 'oven' && r.ovenTemp > 0 && r.passiveTime === 0) add({ key: `${r.id}.bake0`, recipeId: r.id, severity: 'warning', q: `“${nm}” has an oven temperature but no bake time. How long does it bake?`, input: 'number', field: 'passiveTime', unit: 'min', value: 30 });
+    if (isOvenRecipe(r) && r.ovenTemp > 0 && (r.ovenTemp > 550 || r.ovenTemp < 150)) add({ key: `${r.id}.tempodd`, recipeId: r.id, severity: 'warning', q: `${r.ovenTemp}°F looks unusual for “${nm}” – is that right?`, input: 'number', field: 'ovenTemp', unit: '°F', value: r.ovenTemp });
+    if (r.passiveTime > 12 * 60 || r.prepTime > 8 * 60) add({ key: `${r.id}.long`, recipeId: r.id, severity: 'warning', q: `“${nm}” takes over ${fmtDur(Math.max(r.passiveTime, r.prepTime))}. Confirm the unattended cook time:`, input: 'number', field: 'passiveTime', unit: 'min', value: r.passiveTime });
+  }
+  const norm = recipes.map(normalizeRecipe);
+  if (norm.some(isOvenRecipe) && settings.ovens < 1) add({ key: 'ovens', severity: 'error', q: 'Some recipes need an oven. How many ovens do you have?', input: 'number', field: 'ovens', value: 1 });
+  if (norm.some(usesBurner) && settings.burners < 1) add({ key: 'burners', severity: 'error', q: 'Some recipes need the stovetop. How many burners can you use?', input: 'number', field: 'burners', value: 4 });
+  if (settings.anchor === 'target') {
+    const t = fromLocalInput(settings.time);
+    if (t && t < new Date() && !dismissed.includes('past')) add({ key: 'past', severity: 'warning', q: 'Your serving time is in the past. Want to change it?', input: 'datetime', field: 'time', value: settings.time, dismissKey: 'past' });
+  }
+  // Oven conflicts – ask how to handle them.
+  if (norm.length && settings.ovens > 0) {
+    for (const c of idealOvenConflicts(norm, settings, stratParams(settings), settings.anchor === 'target' ? -1 : 1)) {
+      if (dismissed.includes(c.key)) continue;
+      const mid = Math.round((c.a.ovenTemp + c.b.ovenTemp) / 2 / 25) * 25;
+      const options = [{ value: 'stagger', label: 'Stagger them automatically (recommended)' }];
+      if (c.diff <= 75) options.push({ value: 'compromise', label: `Bake both at ${mid}°F and adjust times` });
+      if (settings.ovens < 4) options.push({ value: 'addOven', label: 'I have another oven' });
+      add({ key: 'conf-' + c.key, severity: 'conflict', input: 'choice', options, value: 'stagger', dismissKey: c.key,
+        q: `${c.a.name} (${c.a.ovenTemp}°F) and ${c.b.name} (${c.b.ovenTemp}°F) both want the oven at the same time – ${c.diff}°F apart. How should we handle it?`,
+        conflict: { ids: [c.a.id, c.b.id], temp: mid } });
+    }
+  }
+  return qs;
+}
+function applyCompromise(recipes, ids, temp) {
+  return recipes.map((r) => ids.includes(r.id) && r.ovenTemp !== temp
+    ? { ...r, passiveTime: adjDur(r.passiveTime, r.ovenTemp, temp), ovenTemp: temp, notes: `${r.notes ? r.notes + '\n' : ''}[Kitchen Sync] Adjusted from ${r.ovenTemp}°F / ${r.passiveTime} min to share the oven.` }
+    : r);
+}
+
+/* ================================================================
+   Exports
+   ================================================================ */
+const csvCell = (v) => { const s = String(v ?? ''); return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s; };
+function planRows(plan) {
+  const base = new Date(plan.base);
+  const serveDay = atMin(base, plan.serveAt);
+  return plan.events.map((e) => ({
+    Time: fmtAt(base, e.t, serveDay),
+    Date: atMin(base, e.t).toLocaleDateString(),
+    'Minutes from start': e.t - plan.t0,
+    Recipe: e.recipeId ? plan.recipes[e.recipeId].name : '',
+    Phase: e.kind === 'oven' ? 'Oven' : e.kind === 'ready' ? 'Ready' : e.kind === 'break' ? 'Break' : (PHASES[e.kind] || {}).label || e.kind,
+    Step: e.text, Details: e.detail,
+  }));
+}
+function timelineRows(plan) {
+  const base = new Date(plan.base);
+  const serveDay = atMin(base, plan.serveAt);
+  return plan.placements.map((p) => ({
+    Recipe: plan.recipes[p.recipeId].name, Phase: PHASES[p.kind].label + (p.batches > 1 ? ` (batch ${p.batch})` : ''),
+    Start: fmtAt(base, p.start, serveDay), End: fmtAt(base, p.end, serveDay), 'Duration (min)': p.dur,
+    Oven: p.oven != null ? `Oven ${p.oven + 1}` : '', 'Temp (°F)': p.temp || '', Equipment: (p.equip || []).join(', '),
+  }));
+}
+function exportCSV(plan, checked) {
+  const rows = planRows(plan);
+  const heads = ['Done', ...Object.keys(rows[0] || {})];
+  const lines = [heads.join(',')];
+  rows.forEach((r, i) => lines.push([checked[plan.events[i].id] ? 'x' : '', ...Object.values(r)].map(csvCell).join(',')));
+  lines.push('', 'TIMELINE');
+  const tl = timelineRows(plan);
+  if (tl.length) { lines.push(Object.keys(tl[0]).join(',')); tl.forEach((r) => lines.push(Object.values(r).map(csvCell).join(','))); }
+  download(`kitchen-sync-${slug(new Date(plan.base).toDateString())}.csv`, new Blob(['﻿' + lines.join('\r\n')], { type: 'text/csv;charset=utf-8' }));
+}
+async function exportXLSX(plan, checked) {
+  await loadScript(LIBS.xlsx);
+  const X = window.XLSX;
+  const wb = X.utils.book_new();
+  const cl = planRows(plan).map((r, i) => ({ Done: checked[plan.events[i].id] ? '✔' : '', ...r }));
+  const s1 = X.utils.json_to_sheet(cl);
+  s1['!cols'] = [{ wch: 6 }, { wch: 16 }, { wch: 11 }, { wch: 9 }, { wch: 26 }, { wch: 18 }, { wch: 44 }, { wch: 70 }];
+  X.utils.book_append_sheet(wb, s1, 'Master Checklist');
+  const s2 = X.utils.json_to_sheet(timelineRows(plan));
+  s2['!cols'] = [{ wch: 26 }, { wch: 24 }, { wch: 16 }, { wch: 16 }, { wch: 14 }, { wch: 9 }, { wch: 10 }, { wch: 30 }];
+  X.utils.book_append_sheet(wb, s2, 'Timeline');
+  const s3 = X.utils.json_to_sheet(Object.values(plan.recipes).map((r) => ({
+    Name: r.name, Category: r.category, 'Prep (min)': r.prepTime, 'Chill/Rise (min)': r.waitTime, 'Active (min)': r.activeTime,
+    'Passive (min)': r.passiveTime, Where: r.passiveWhere, 'Oven °F': r.ovenTemp || '', Batches: r.batches, 'Rest (min)': r.restTime,
+    Equipment: r.equipment.join(', '), Concurrent: r.concurrent ? 'Yes' : 'No', Notes: r.notes,
+  })));
+  X.utils.book_append_sheet(wb, s3, 'Recipes');
+  X.writeFile(wb, `kitchen-sync-${slug(new Date(plan.base).toDateString())}.xlsx`);
+}
+function exportPNG(plan) {
+  const base = new Date(plan.base);
+  const serveDay = atMin(base, plan.serveAt);
+  const W = 1600, labelW = 230, padR = 40, top = 130, laneH = 26, rowGap = 10;
+  const rowsH = plan.rows.map((r) => r.lanes * laneH + rowGap);
+  const H = top + rowsH.reduce((a, b) => a + b, 0) + 130;
+  const c = document.createElement('canvas');
+  c.width = W * 2; c.height = H * 2;
+  const g = c.getContext('2d');
+  g.scale(2, 2);
+  g.fillStyle = '#ffffff'; g.fillRect(0, 0, W, H);
+  const font = (w, s) => `${w} ${s}px Inter, system-ui, sans-serif`;
+  g.fillStyle = '#ea580c'; g.font = font(800, 30); g.fillText('Kitchen Sync', 40, 54);
+  g.fillStyle = '#1c1917'; g.font = font(600, 18);
+  g.fillText(`${plan.anchorMode === 'target' ? 'Serve at' : 'Ready at'} ${fmtAt(base, plan.serveAt)} · ${serveDay.toLocaleDateString([], { weekday: 'long', month: 'long', day: 'numeric' })}`, 260, 52);
+  g.fillStyle = '#78716c'; g.font = font(500, 14);
+  g.fillText(`Start ${fmtAt(base, plan.t0, serveDay)} · Total ${fmtDur(plan.stats.total)} · Hands-on ${fmtDur(plan.stats.handsOn)} · ${STRATEGIES[plan.strategy].label} mode · ${plan.settings.ovens} oven(s), ${plan.settings.burners} burners`, 40, 84);
+  const t0 = floorTo(plan.t0, 30), t1 = ceilTo(plan.t1 + 20, 30);
+  const x = (t) => labelW + ((t - t0) / (t1 - t0)) * (W - labelW - padR);
+  const tickStep = t1 - t0 > 600 ? 60 : 30;
+  g.font = font(500, 11);
+  for (let t = t0; t <= t1; t += tickStep) {
+    g.strokeStyle = t % 60 === 0 ? '#e7e5e4' : '#f5f5f4'; g.beginPath(); g.moveTo(x(t), top - 14); g.lineTo(x(t), H - 110); g.stroke();
+    g.fillStyle = '#a8a29e'; g.fillText(fmtClock(atMin(base, t)), x(t) + 3, top - 18);
+  }
+  let y = top;
+  const rr = (X0, Y0, w, h, r) => { g.beginPath(); if (g.roundRect) g.roundRect(X0, Y0, w, h, r); else g.rect(X0, Y0, w, h); };
+  plan.rows.forEach((row, i) => {
+    if (i % 2 === 0) { g.fillStyle = '#fafaf9'; g.fillRect(0, y - 3, W, rowsH[i]); }
+    g.fillStyle = row.lane ? '#57534e' : '#1c1917'; g.font = font(row.lane ? 600 : 700, 13);
+    if (row.color) { g.fillStyle = row.color; rr(40, y + 7, 9, 9, 3); g.fill(); g.fillStyle = '#1c1917'; }
+    g.fillText(row.label.length > 24 ? row.label.slice(0, 23) + '…' : row.label, 56, y + 16);
+    row.items.forEach((it) => {
+      const X0 = x(it.start), w = Math.max(3, x(it.end) - X0), Y0 = y + it.lane * laneH;
+      g.fillStyle = PHASES[it.kind].hex; rr(X0, Y0 + 2, w, laneH - 6, 5); g.fill();
+      if (w > 34) {
+        g.save(); g.beginPath(); g.rect(X0, Y0, w - 3, laneH); g.clip();
+        g.fillStyle = ['bake', 'serve'].includes(it.kind) ? '#ffffff' : '#1c1917'; g.font = font(600, 11);
+        g.fillText(it.label, X0 + 5, Y0 + 17); g.restore();
+      }
+    });
+    y += rowsH[i];
+  });
+  g.strokeStyle = '#059669'; g.lineWidth = 2; g.setLineDash([5, 4]);
+  g.beginPath(); g.moveTo(x(plan.serveAt), top - 10); g.lineTo(x(plan.serveAt), y); g.stroke(); g.setLineDash([]);
+  let lx = 40; const ly = H - 70; g.font = font(500, 12);
+  Object.entries(PHASES).forEach(([k, p]) => {
+    g.fillStyle = p.hex; rr(lx, ly, 14, 14, 3); g.fill();
+    g.fillStyle = '#44403c'; g.fillText(p.label, lx + 20, ly + 11);
+    lx += g.measureText(p.label).width + 44;
+  });
+  g.fillStyle = '#a8a29e'; g.font = font(400, 11); g.fillText('Generated with Kitchen Sync', 40, H - 28);
+  c.toBlob((b) => download(`kitchen-sync-plan-${slug(serveDay.toDateString())}.png`, b), 'image/png');
+}
+
+/* ================================================================
+   UI primitives
+   ================================================================ */
+const btn = {
+  primary: 'inline-flex items-center justify-center gap-2 rounded-xl bg-orange-600 px-4 py-2.5 text-sm font-semibold text-white shadow-sm hover:bg-orange-700 focus:outline-none focus-visible:ring-2 focus-visible:ring-orange-400 disabled:opacity-50 disabled:cursor-not-allowed transition',
+  secondary: 'inline-flex items-center justify-center gap-2 rounded-xl border border-stone-300 bg-white px-3.5 py-2 text-sm font-semibold text-stone-700 hover:bg-stone-50 focus:outline-none focus-visible:ring-2 focus-visible:ring-orange-300 disabled:opacity-50 transition',
+  ghost: 'inline-flex items-center justify-center gap-1.5 rounded-lg px-2.5 py-1.5 text-sm font-medium text-stone-600 hover:bg-stone-100 hover:text-stone-900 transition',
+};
+const inputCls = 'w-full rounded-lg border border-stone-300 bg-white px-3 py-2 text-sm text-stone-800 shadow-sm focus:border-orange-400 focus:outline-none focus:ring-2 focus:ring-orange-200';
+const Card = ({ className = '', children }) => <div className={`rounded-2xl border border-stone-200 bg-white shadow-sm ${className}`}>{children}</div>;
+
+function Stepper({ label, icon, value, onChange, min = 0, max = 10, hint }) {
+  return (
+    <div className="rounded-2xl border border-stone-200 bg-white p-4 shadow-sm">
+      <div className="flex items-center gap-2 text-sm font-semibold text-stone-700"><Icon name={icon} className="h-4 w-4 text-orange-600" />{label}</div>
+      <div className="mt-3 flex items-center justify-between gap-3">
+        <button className="grid h-10 w-10 place-items-center rounded-xl border border-stone-300 hover:bg-stone-50 disabled:opacity-40" disabled={value <= min} onClick={() => onChange(clamp(value - 1, min, max))} aria-label={`Fewer ${label}`}><Icon name="Minus" /></button>
+        <span className="text-3xl font-bold tabular">{value}</span>
+        <button className="grid h-10 w-10 place-items-center rounded-xl border border-stone-300 hover:bg-stone-50 disabled:opacity-40" disabled={value >= max} onClick={() => onChange(clamp(value + 1, min, max))} aria-label={`More ${label}`}><Icon name="Plus" /></button>
+      </div>
+      {hint && <p className="mt-2 text-xs text-stone-500">{hint}</p>}
+    </div>
+  );
+}
+
+function Modal({ title, icon, onClose, children, footer, wide }) {
+  useEffect(() => {
+    const h = (e) => e.key === 'Escape' && onClose?.();
+    window.addEventListener('keydown', h);
+    return () => window.removeEventListener('keydown', h);
+  }, [onClose]);
+  return (
+    <div className="fixed inset-0 z-50 flex items-end justify-center bg-stone-900/50 p-0 sm:items-center sm:p-4 print:hidden" onMouseDown={(e) => e.target === e.currentTarget && onClose?.()}>
+      <div className={`flex max-h-[92vh] w-full flex-col rounded-t-2xl bg-white shadow-2xl sm:rounded-2xl ${wide ? 'sm:max-w-3xl' : 'sm:max-w-xl'}`} role="dialog" aria-modal="true">
+        <div className="flex items-center justify-between border-b border-stone-200 px-5 py-4">
+          <h2 className="flex items-center gap-2 text-lg font-bold">{icon && <Icon name={icon} className="h-5 w-5 text-orange-600" />}{title}</h2>
+          <button className={btn.ghost} onClick={onClose} aria-label="Close"><Icon name="X" className="h-5 w-5" /></button>
+        </div>
+        <div className="overflow-y-auto px-5 py-4 scroll-thin">{children}</div>
+        {footer && <div className="flex flex-wrap justify-end gap-2 border-t border-stone-200 px-5 py-3">{footer}</div>}
+      </div>
+    </div>
+  );
+}
+
+function RecipeBar({ r, className = 'h-2.5' }) {
+  const segs = [['prep', r.prepTime], ['wait', r.waitTime], ['active', r.activeTime],
+    [r.passiveWhere === 'oven' ? 'bake' : r.passiveWhere === 'stovetop' ? 'simmer' : 'hold', r.passiveTime * (r.passiveWhere === 'counter' ? 1 : r.batches)], ['rest', r.restTime]].filter(([, v]) => v > 0);
+  const total = segs.reduce((s, [, v]) => s + v, 0) || 1;
+  return (
+    <div className={`flex w-full overflow-hidden rounded-full bg-stone-100 ${className}`}>
+      {segs.map(([k, v]) => <div key={k} style={{ width: `${(v / total) * 100}%`, background: PHASES[k].hex }} title={`${PHASES[k].label}: ${fmtDur(v)}`} />)}
+    </div>
+  );
+}
+
+/* ================================================================
+   Step 1 – Kitchen setup
+   ================================================================ */
+function KitchenStep({ settings, setSettings, recipes }) {
+  const set = (k) => (v) => setSettings((s) => ({ ...s, [k]: v }));
+  const equip = useMemo(() => {
+    const m = {};
+    recipes.forEach((r) => r.equipment.forEach((n) => { const k = n.toLowerCase(); (m[k] ||= { name: n, users: [] }).users.push(r.name || 'Untitled'); }));
+    return Object.values(m).sort((a, b) => b.users.length - a.users.length);
+  }, [recipes]);
+  return (
+    <div className="space-y-6">
+      <div>
+        <h2 className="text-2xl font-bold tracking-tight">What are you working with?</h2>
+        <p className="mt-1 text-stone-600">Kitchen Sync never double-books an oven rack, a burner, a pair of hands or a piece of equipment.</p>
+      </div>
+      <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+        <Stepper label="Ovens" icon="Flame" value={settings.ovens} onChange={set('ovens')} min={0} max={4} hint="Countertop & toaster ovens count." />
+        <Stepper label="Racks per oven" icon="Layers" value={settings.racks} onChange={set('racks')} min={1} max={4} hint="Dishes at the same temp can share." />
+        <Stepper label="Stovetop burners" icon="CookingPot" value={settings.burners} onChange={set('burners')} min={0} max={8} hint="Include induction hobs or hot plates." />
+        <Stepper label="Cooks in the kitchen" icon="Users" value={settings.cooks} onChange={set('cooks')} min={1} max={4} hint="Hands-on tasks run in parallel per cook." />
+      </div>
+      <Card className="p-5">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <h3 className="flex items-center gap-2 font-semibold"><Icon name="Package" className="h-4 w-4 text-orange-600" />Equipment inventory</h3>
+          <span className="text-xs text-stone-500">Built from your recipes · set how many you own</span>
+        </div>
+        {equip.length === 0 ? (
+          <p className="mt-3 rounded-xl bg-stone-50 p-4 text-sm text-stone-500">Add recipes in the next step – their equipment (stand mixer, stockpot, sheet pans…) will show up here.</p>
+        ) : (
+          <div className="mt-3 divide-y divide-stone-100">
+            {equip.map((e) => {
+              const g = equipGroup(e.name);
+              const count = eqCount(settings, e.name);
+              const tight = g !== 'tool' && e.users.length > count;
+              return (
+                <div key={e.name} className="flex flex-wrap items-center gap-3 py-2.5">
+                  <div className="min-w-0 flex-1">
+                    <div className="font-medium">{e.name} <span className="ml-1 rounded-full bg-stone-100 px-2 py-0.5 text-xs font-medium text-stone-500">{EQUIP_GROUP_LABEL[g]}</span></div>
+                    <div className="truncate text-xs text-stone-500">Used by {e.users.join(', ')}</div>
+                  </div>
+                  {g === 'tool' ? <span className="text-xs text-stone-400">no conflicts tracked</span> : (
+                    <div className="flex items-center gap-2">
+                      {tight && <span className="text-xs font-medium text-amber-700">shared – will be scheduled around</span>}
+                      <input type="number" min={1} max={12} value={count} className={inputCls + ' w-20 text-center'}
+                        onChange={(ev) => setSettings((s) => ({ ...s, equipment: { ...s.equipment, [e.name.toLowerCase()]: clamp(int0(ev.target.value) || 1, 1, 12) } }))} aria-label={`How many ${e.name}`} />
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </Card>
+    </div>
+  );
+}
+
+/* ================================================================
+   Step 2 – Recipes
+   ================================================================ */
+function AISettings({ ai, setAi, hosted }) {
+  const [open, setOpen] = useState(false);
+  const [draft, setDraft] = useState('');
+  const available = !!ai.key || hosted.enabled;
+  const on = ai.enabled && available;
+  const sub = !on ? (available ? 'using the basic pattern reader' : 'add an API key to turn it on')
+    : ai.key ? 'Claude reads your files with your own API key'
+    : hosted.remaining > 0 ? `Claude reads your files · ${hosted.remaining} of ${hosted.limit} free imports left today`
+    : `today's ${hosted.limit} free imports are used up – basic reader until tomorrow`;
+  return (
+    <div className={`mt-4 rounded-xl border p-3 ${on ? 'border-violet-200 bg-violet-50' : 'border-stone-200 bg-stone-50'}`}>
+      <div className="flex flex-wrap items-center gap-2">
+        <Icon name="Sparkles" className={`h-4 w-4 ${on ? 'text-violet-600' : 'text-stone-400'}`} />
+        <span className="text-sm font-semibold">{on ? 'AI reading is on' : 'AI reading is off'}</span>
+        <span className="text-xs text-stone-500">{sub}</span>
+        <div className="ml-auto flex items-center gap-1">
+          {available && (
+            <label className="flex cursor-pointer items-center gap-1.5 text-xs font-medium text-stone-600">
+              <input type="checkbox" className="accent-violet-600" checked={ai.enabled} onChange={(e) => setAi({ ...ai, enabled: e.target.checked })} />Use AI
+            </label>
+          )}
+          <button className={btn.ghost + ' !text-xs'} onClick={() => setOpen((o) => !o)}>{open ? 'Hide' : available ? 'Settings' : 'Set up'}</button>
+        </div>
+      </div>
+      {open && (
+        <div className="mt-3 space-y-2 text-xs text-stone-600">
+          <p>AI reading understands handwriting, photos taken at an angle, multi-stage bakes and scattered timings far better than the basic reader.
+            {hosted.enabled
+              ? ' It’s included here with a daily allowance. If you have your own Anthropic API key, you can use it instead for unlimited imports, billed to your account.'
+              : <> It needs an Anthropic API key (create one at <a className="font-semibold text-violet-700 underline" href="https://console.anthropic.com/settings/keys" target="_blank" rel="noreferrer">console.anthropic.com</a>). Each recipe usually costs a few cents.</>}
+          </p>
+          {ai.key ? (
+            <div className="flex flex-wrap items-center gap-2">
+              <code className="rounded bg-white px-2 py-1 text-stone-700">{ai.key.slice(0, 10)}…{ai.key.slice(-4)}</code>
+              <button className={btn.ghost + ' !text-xs hover:!text-red-600'} onClick={() => setAi({ key: '', enabled: hosted.enabled })}><Icon name="Trash2" className="h-3.5 w-3.5" />Remove key</button>
+            </div>
+          ) : (
+            <div className="flex gap-2">
+              <input type="password" autoComplete="off" className={inputCls} placeholder="sk-ant-…" value={draft} onChange={(e) => setDraft(e.target.value.trim())} />
+              <button className={btn.primary + ' !py-1.5'} disabled={!draft} onClick={() => { setAi({ key: draft, enabled: true }); setDraft(''); setOpen(false); }}>Save</button>
+            </div>
+          )}
+          <p className="text-stone-500">The key is saved only in this browser and is sent only to Anthropic, together with the files you import. Anyone using this browser profile could find it, so remove it on shared computers.</p>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ImportPanel({ onImport, busy, progress, ai, setAi, hosted }) {
+  const [drag, setDrag] = useState(false);
+  const [paste, setPaste] = useState('');
+  const [showPaste, setShowPaste] = useState(false);
+  const fileRef = useRef();
+  return (
+    <Card className="p-5">
+      <h3 className="flex items-center gap-2 font-semibold"><Icon name="Upload" className="h-4 w-4 text-orange-600" />Import recipes</h3>
+      <p className="mt-1 text-sm text-stone-500">Photos or scans, PDFs, text/Markdown, saved recipe web pages (.html) or JSON.</p>
+      <AISettings ai={ai} setAi={setAi} hosted={hosted} />
+      <div
+        className={`mt-4 flex cursor-pointer flex-col items-center justify-center rounded-2xl border-2 border-dashed px-4 py-8 text-center transition ${drag ? 'border-orange-500 bg-orange-50' : 'border-stone-300 hover:border-orange-400 hover:bg-orange-50/40'}`}
+        onClick={() => !busy && fileRef.current?.click()}
+        onDragOver={(e) => { e.preventDefault(); setDrag(true); }}
+        onDragLeave={() => setDrag(false)}
+        onDrop={(e) => { e.preventDefault(); setDrag(false); if (!busy && e.dataTransfer.files.length) onImport([...e.dataTransfer.files]); }}
+        role="button" tabIndex={0} onKeyDown={(e) => e.key === 'Enter' && fileRef.current?.click()}
+      >
+        {busy ? <Icon name="Loader2" className="h-8 w-8 animate-spin text-orange-600" /> : <Icon name="FileText" className="h-8 w-8 text-stone-400" />}
+        <div className="mt-2 font-semibold text-stone-700">{busy ? progress || 'Reading…' : 'Drop recipe files here or click to browse'}</div>
+        <div className="mt-1 text-xs text-stone-500">.jpg .png .pdf .txt .md .html .json – multiple files OK</div>
+        <input ref={fileRef} type="file" multiple className="hidden" accept="image/*,.pdf,.txt,.md,.markdown,.json,.html,.htm,.csv"
+          onChange={(e) => { if (e.target.files.length) onImport([...e.target.files]); e.target.value = ''; }} />
+      </div>
+      <button className={btn.ghost + ' mt-3'} onClick={() => setShowPaste((v) => !v)}><Icon name="ClipboardPaste" />{showPaste ? 'Hide' : 'Or paste recipe text'}</button>
+      {showPaste && (
+        <div className="mt-2 space-y-2">
+          <textarea className={inputCls + ' h-40 font-mono text-xs'} value={paste} onChange={(e) => setPaste(e.target.value)}
+            placeholder={'Classic Apple Pie\nPrep time: 30 minutes\nCook time: 1 hour\n\nIngredients\n...\n\nInstructions\nPreheat oven to 425°F...\n\n(Separate multiple recipes with a line of ---)'} />
+          <button className={btn.primary} disabled={!paste.trim() || busy} onClick={() => { onImport(null, paste); setPaste(''); setShowPaste(false); }}><Icon name="Wand2" />Read recipe</button>
+        </div>
+      )}
+    </Card>
+  );
+}
+
+function SampleSets({ onLoad }) {
+  return (
+    <Card className="p-5">
+      <h3 className="flex items-center gap-2 font-semibold"><Icon name="Sparkles" className="h-4 w-4 text-orange-600" />Try a sample menu</h3>
+      <div className="mt-3 space-y-2">
+        {SAMPLE_SETS.map((s) => (
+          <div key={s.id} className="flex items-center gap-3 rounded-xl border border-stone-200 p-3 hover:border-orange-300">
+            <div className="grid h-10 w-10 shrink-0 place-items-center rounded-xl bg-orange-100 text-orange-700"><Icon name={s.icon} className="h-5 w-5" /></div>
+            <div className="min-w-0 flex-1">
+              <div className="text-sm font-semibold">{s.name}</div>
+              <div className="text-xs text-stone-500">{s.blurb}</div>
+            </div>
+            <div className="flex shrink-0 flex-col gap-1 sm:flex-row">
+              <button className={btn.secondary + ' !px-2.5 !py-1.5 !text-xs'} onClick={() => onLoad(s, 'replace')}>Load</button>
+              <button className={btn.ghost + ' !text-xs'} onClick={() => onLoad(s, 'add')} title="Add to current recipes">+ Add</button>
+            </div>
+          </div>
+        ))}
+      </div>
+    </Card>
+  );
+}
+
+function RecipeCard({ r, color, onEdit, onDup, onDelete }) {
+  const chips = [];
+  if (r.prepTime) chips.push(['Clock', `Prep ${fmtDur(r.prepTime)}`]);
+  if (r.waitTime) chips.push(['Snowflake', `${r.waitLabel || 'Chill'} ${fmtDur(r.waitTime)}`]);
+  if (r.activeTime) chips.push(['Hand', `Active ${fmtDur(r.activeTime)}`]);
+  if (r.passiveTime) chips.push([r.passiveWhere === 'oven' ? 'Flame' : r.passiveWhere === 'stovetop' ? 'CookingPot' : 'Timer',
+    `${r.passiveWhere === 'oven' ? `${r.ovenTemp}°F · ` : r.passiveWhere === 'stovetop' ? 'Simmer · ' : 'Set · '}${fmtDur(r.passiveTime)}${r.batches > 1 ? ` × ${r.batches}` : ''}`]);
+  if (r.restTime) chips.push(['Timer', `Rest ${fmtDur(r.restTime)}`]);
+  return (
+    <div className="group rounded-2xl border border-stone-200 bg-white p-4 shadow-sm transition hover:shadow-md">
+      <div className="flex items-start gap-3">
+        <span className="mt-1.5 h-3 w-3 shrink-0 rounded-full" style={{ background: color }} />
+        <div className="min-w-0 flex-1">
+          <div className="flex flex-wrap items-center gap-2">
+            <h4 className="font-semibold">{r.name || <span className="italic text-stone-400">Untitled</span>}</h4>
+            <span className="rounded-full bg-stone-100 px-2 py-0.5 text-xs font-medium text-stone-600">{r.category}</span>
+            {!r.concurrent && <span className="rounded-full bg-violet-100 px-2 py-0.5 text-xs font-medium text-violet-700">needs oven to itself</span>}
+            {r.fullOven && <span className="rounded-full bg-rose-100 px-2 py-0.5 text-xs font-medium text-rose-700">full oven</span>}
+            {r._review?.length > 0 && <span className="rounded-full bg-amber-100 px-2 py-0.5 text-xs font-medium text-amber-800">needs review</span>}
+          </div>
+          <div className="mt-2 flex flex-wrap gap-x-3 gap-y-1 text-xs text-stone-600">
+            {chips.map(([ic, t]) => <span key={t} className="inline-flex items-center gap-1"><Icon name={ic} className="h-3.5 w-3.5 text-stone-400" />{t}</span>)}
+          </div>
+          <RecipeBar r={r} className="mt-3 h-2" />
+          {r.equipment.length > 0 && <div className="mt-2 truncate text-xs text-stone-500">🍳 {r.equipment.join(' · ')}</div>}
+        </div>
+        <div className="flex shrink-0 flex-col gap-0.5 sm:flex-row">
+          <button className={btn.ghost} onClick={onEdit} aria-label="Edit"><Icon name="Pencil" /></button>
+          <button className={btn.ghost} onClick={onDup} aria-label="Duplicate"><Icon name="Copy" /></button>
+          <button className={btn.ghost + ' hover:!text-red-600'} onClick={onDelete} aria-label="Delete"><Icon name="Trash2" /></button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function Field({ label, hint, children, className = '' }) {
+  return (
+    <label className={`block ${className}`}>
+      <span className="text-xs font-semibold uppercase tracking-wide text-stone-500">{label}</span>
+      <div className="mt-1">{children}</div>
+      {hint && <span className="mt-1 block text-xs text-stone-400">{hint}</span>}
+    </label>
+  );
+}
+function MinInput({ value, onChange, suffix = 'min', min = 0, max = 2000 }) {
+  return (
+    <div className="relative">
+      <input type="number" min={min} max={max} className={inputCls + ' pr-12'} value={value} onChange={(e) => onChange(e.target.value === '' ? '' : clamp(int0(e.target.value), min, max))} />
+      <span className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-xs text-stone-400">{suffix}</span>
+    </div>
+  );
+}
+
+function RecipeEditor({ recipe, onSave, onClose }) {
+  const [r, setR] = useState(() => ({ ...recipe }));
+  const [eqInput, setEqInput] = useState('');
+  const set = (k) => (v) => setR((x) => ({ ...x, [k]: v }));
+  const addEq = (n) => { n = n.trim(); if (n && !r.equipment.some((e) => e.toLowerCase() === n.toLowerCase())) setR((x) => ({ ...x, equipment: [...x.equipment, n] })); setEqInput(''); };
+  const norm = normalizeRecipe(r);
+  return (
+    <Modal title={recipe.name ? `Edit “${recipe.name}”` : 'New recipe'} icon="ChefHat" onClose={onClose} wide
+      footer={<>
+        <button className={btn.secondary} onClick={onClose}>Cancel</button>
+        <button className={btn.primary} disabled={!String(r.name).trim()} onClick={() => { const out = normalizeRecipe(r); delete out._review; onSave(out); }}><Icon name="Check" />Save recipe</button>
+      </>}>
+      <div className="space-y-5">
+        <div className="grid gap-3 sm:grid-cols-3">
+          <Field label="Name" className="sm:col-span-2"><input className={inputCls} value={r.name} onChange={(e) => set('name')(e.target.value)} placeholder="e.g. Roast Turkey" autoFocus /></Field>
+          <Field label="Category">
+            <select className={inputCls} value={r.category} onChange={(e) => set('category')(e.target.value)}>{CATEGORIES.map((c) => <option key={c}>{c}</option>)}</select>
+          </Field>
+        </div>
+
+        <div className="rounded-xl bg-stone-50 p-4">
+          <div className="mb-3 flex items-center justify-between"><span className="text-sm font-semibold">Timing</span><RecipeBar r={norm} className="ml-4 h-2.5 max-w-[50%]" /></div>
+          <div className="grid gap-3 sm:grid-cols-3">
+            <Field label="Prep time" hint="Chopping, mixing, assembling"><MinInput value={r.prepTime} onChange={set('prepTime')} /></Field>
+            <Field label="Chill / rise / marinate" hint="Hands-off before cooking"><MinInput value={r.waitTime} onChange={set('waitTime')} /></Field>
+            <Field label="Wait label"><input className={inputCls} value={r.waitLabel} onChange={(e) => set('waitLabel')(e.target.value)} disabled={!norm.waitTime} /></Field>
+            <Field label="Active cook time" hint="Hands-on: sauté, stir, roll, flip"><MinInput value={r.activeTime} onChange={set('activeTime')} /></Field>
+            <Field label="Active step uses">
+              <select className={inputCls} value={r.activeOnStove ? 'stove' : 'hands'} onChange={(e) => set('activeOnStove')(e.target.value === 'stove')}>
+                <option value="stove">A stovetop burner</option><option value="hands">Just my hands (counter)</option>
+              </select>
+            </Field>
+            <Field label="Rest / cool time" hint="After cooking, before serving"><MinInput value={r.restTime} onChange={set('restTime')} /></Field>
+            <Field label="Passive cook / bake time" hint="Unattended: oven, simmer, set"><MinInput value={r.passiveTime} onChange={set('passiveTime')} /></Field>
+            <Field label="Passive step happens in">
+              <select className={inputCls} value={r.passiveWhere} onChange={(e) => set('passiveWhere')(e.target.value)}>
+                <option value="oven">Oven</option><option value="stovetop">Stovetop (simmer)</option><option value="counter">Counter / fridge</option>
+              </select>
+            </Field>
+            <Field label="Batches" hint="e.g. 3 trays of cookies"><MinInput value={r.batches} onChange={set('batches')} suffix="×" min={1} max={12} /></Field>
+          </div>
+        </div>
+
+        <div className={`grid gap-3 sm:grid-cols-3 ${r.passiveWhere !== 'oven' ? 'opacity-50' : ''}`}>
+          <Field label="Oven temperature"><MinInput value={r.ovenTemp} onChange={set('ovenTemp')} suffix="°F" max={600} /></Field>
+          <Field label="Oven space">
+            <select className={inputCls} value={r.fullOven ? 'full' : 'rack'} onChange={(e) => set('fullOven')(e.target.value === 'full')} disabled={r.passiveWhere !== 'oven'}>
+              <option value="rack">One rack</option><option value="full">Whole oven</option>
+            </select>
+          </Field>
+          <Field label="Can cook alongside other dishes?">
+            <div className="flex overflow-hidden rounded-lg border border-stone-300">
+              {[[true, 'Yes'], [false, 'No']].map(([v, l]) => (
+                <button key={l} type="button" onClick={() => set('concurrent')(v)} className={`flex-1 py-2 text-sm font-semibold ${r.concurrent === v ? 'bg-orange-600 text-white' : 'bg-white text-stone-600 hover:bg-stone-50'}`}>{l}</button>
+              ))}
+            </div>
+          </Field>
+        </div>
+
+        <Field label="Required equipment">
+          <div className="flex flex-wrap gap-1.5">
+            {r.equipment.map((e) => (
+              <span key={e} className="inline-flex items-center gap-1 rounded-full bg-orange-100 py-1 pl-3 pr-1.5 text-xs font-medium text-orange-800">
+                {e}<button type="button" onClick={() => setR((x) => ({ ...x, equipment: x.equipment.filter((y) => y !== e) }))} className="rounded-full p-0.5 hover:bg-orange-200" aria-label={`Remove ${e}`}><Icon name="X" className="h-3 w-3" /></button>
+              </span>
+            ))}
+          </div>
+          <div className="mt-2 flex gap-2">
+            <input className={inputCls} list="eq-list" value={eqInput} onChange={(e) => setEqInput(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); addEq(eqInput); } }} placeholder="Stand Mixer, Stockpot, Sheet Pan…" />
+            <datalist id="eq-list">{KNOWN_EQUIPMENT.map((k) => <option key={k} value={k} />)}</datalist>
+            <button type="button" className={btn.secondary} onClick={() => addEq(eqInput)}>Add</button>
+          </div>
+        </Field>
+        <Field label="Prep steps / ingredient notes">
+          <textarea className={inputCls + ' h-28'} value={r.notes} onChange={(e) => set('notes')(e.target.value)} placeholder="Shown in your checklist alongside each step." />
+        </Field>
+      </div>
+    </Modal>
+  );
+}
+
+function RecipesStep({ recipes, setRecipes, onEdit, onImport, busy, progress, onLoadSample, ai, setAi, hosted }) {
+  const exportJSON = () => download('kitchen-sync-recipes.json', new Blob([JSON.stringify(recipes.map(({ _review, ...r }) => r), null, 2)], { type: 'application/json' }));
+  return (
+    <div className="space-y-6">
+      <div>
+        <h2 className="text-2xl font-bold tracking-tight">What's on the menu?</h2>
+        <p className="mt-1 text-stone-600">Import your recipes or start from a sample. Every detail is editable.</p>
+      </div>
+      <div className="grid gap-6 lg:grid-cols-5">
+        <div className="space-y-6 lg:col-span-2">
+          <ImportPanel onImport={onImport} busy={busy} progress={progress} ai={ai} setAi={setAi} hosted={hosted} />
+          <SampleSets onLoad={onLoadSample} />
+        </div>
+        <div className="lg:col-span-3">
+          <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+            <h3 className="font-semibold">{recipes.length} recipe{recipes.length === 1 ? '' : 's'}</h3>
+            <div className="flex flex-wrap gap-2">
+              {recipes.length > 0 && <button className={btn.ghost} onClick={exportJSON}><Icon name="FileJson" />Save set</button>}
+              {recipes.length > 0 && <button className={btn.ghost + ' hover:!text-red-600'} onClick={() => confirm('Remove all recipes?') && setRecipes([])}><Icon name="Trash2" />Clear</button>}
+              <button className={btn.secondary} onClick={() => onEdit(blankRecipe())}><Icon name="Plus" />Add manually</button>
+            </div>
+          </div>
+          {recipes.length === 0 ? (
+            <div className="grid place-items-center rounded-2xl border-2 border-dashed border-stone-300 bg-white/60 px-6 py-16 text-center">
+              <Icon name="ChefHat" className="h-10 w-10 text-stone-300" />
+              <p className="mt-3 font-semibold text-stone-600">No recipes yet</p>
+              <p className="mt-1 max-w-sm text-sm text-stone-500">Load the Thanksgiving sample to see Kitchen Sync juggle a turkey, two casseroles and a pie in a single oven.</p>
+            </div>
+          ) : (
+            <div className="space-y-3">
+              {recipes.map((r, i) => (
+                <RecipeCard key={r.id} r={r} color={RECIPE_COLORS[i % RECIPE_COLORS.length]} onEdit={() => onEdit(r)}
+                  onDup={() => setRecipes((rs) => { const c = { ...r, id: uid(), name: r.name + ' (copy)' }; const out = [...rs]; out.splice(i + 1, 0, c); return out; })}
+                  onDelete={() => setRecipes((rs) => rs.filter((x) => x.id !== r.id))} />
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ================================================================
+   Step 3 – Schedule settings
+   ================================================================ */
+function ChoiceCard({ active, onClick, icon, title, children }) {
+  return (
+    <button type="button" onClick={onClick}
+      className={`w-full rounded-2xl border-2 p-4 text-left transition ${active ? 'border-orange-500 bg-orange-50 shadow-sm' : 'border-stone-200 bg-white hover:border-orange-300'}`}>
+      <div className="flex items-center gap-3">
+        <div className={`grid h-10 w-10 place-items-center rounded-xl ${active ? 'bg-orange-600 text-white' : 'bg-stone-100 text-stone-500'}`}><Icon name={icon} className="h-5 w-5" /></div>
+        <div className="font-semibold">{title}</div>
+        {active && <Icon name="CheckCircle2" className="ml-auto h-5 w-5 text-orange-600" />}
+      </div>
+      <div className="mt-2 text-sm text-stone-600">{children}</div>
+    </button>
+  );
+}
+function ScheduleStep({ settings, setSettings, recipes, onGenerate }) {
+  const set = (k, v) => setSettings((s) => ({ ...s, [k]: v }));
+  const norm = recipes.map(normalizeRecipe);
+  const preview = useMemo(() => idealOvenConflicts(norm, settings, stratParams(settings), settings.anchor === 'target' ? -1 : 1), [recipes, settings]);
+  return (
+    <div className="space-y-6">
+      <div>
+        <h2 className="text-2xl font-bold tracking-tight">Set the clock & the pace</h2>
+        <p className="mt-1 text-stone-600">Pick an anchor time and how intense you want the session to be.</p>
+      </div>
+      <div className="grid gap-6 lg:grid-cols-2">
+        <Card className="p-5">
+          <h3 className="flex items-center gap-2 font-semibold"><Icon name="CalendarClock" className="h-4 w-4 text-orange-600" />Time anchor</h3>
+          <div className="mt-3 grid gap-3 sm:grid-cols-2">
+            <ChoiceCard active={settings.anchor === 'target'} onClick={() => set('anchor', 'target')} icon="Target" title="Ready by…">Work backwards so everything lands on the table together.</ChoiceCard>
+            <ChoiceCard active={settings.anchor === 'start'} onClick={() => set('anchor', 'start')} icon="Play" title="Start at…">Work forwards from when you walk into the kitchen.</ChoiceCard>
+          </div>
+          <Field label={settings.anchor === 'target' ? 'I need everything ready by' : 'I want to start cooking at'} className="mt-4">
+            <input type="datetime-local" className={inputCls} value={settings.time} onChange={(e) => set('time', e.target.value)} />
+          </Field>
+        </Card>
+        <Card className="p-5">
+          <h3 className="flex items-center gap-2 font-semibold"><Icon name="Zap" className="h-4 w-4 text-orange-600" />Optimization strategy</h3>
+          <div className="mt-3 grid gap-3 sm:grid-cols-2">
+            <ChoiceCard active={settings.strategy === 'express'} onClick={() => set('strategy', 'express')} icon="Zap" title="Express">
+              <ul className="list-disc space-y-0.5 pl-4"><li>Shortest total time</li><li>Shares racks; nudges temps ±25°F</li><li>Back-to-back prep</li></ul>
+            </ChoiceCard>
+            <ChoiceCard active={settings.strategy === 'chill'} onClick={() => set('strategy', 'chill')} icon="Coffee" title="Chill Baking">
+              <ul className="list-disc space-y-0.5 pl-4"><li>One dish per oven at a time</li><li>Breathing room between tasks</li><li>Exact recipe temps</li></ul>
+            </ChoiceCard>
+          </div>
+          {settings.strategy === 'chill' && (
+            <Field label={`Buffer after each hands-on task: ${settings.buffer} min`} className="mt-4">
+              <input type="range" min={0} max={30} step={5} value={settings.buffer} onChange={(e) => set('buffer', +e.target.value)} className="w-full accent-orange-600" />
+            </Field>
+          )}
+        </Card>
+      </div>
+      <Card className="p-5">
+        <h3 className="flex items-center gap-2 font-semibold"><Icon name="Thermometer" className="h-4 w-4 text-orange-600" />Pre-flight oven check</h3>
+        {preview.length === 0 ? (
+          <p className="mt-2 flex items-center gap-2 text-sm text-emerald-700"><Icon name="CheckCircle2" />No oven temperature clashes detected with {settings.ovens} oven{settings.ovens === 1 ? '' : 's'}.</p>
+        ) : (
+          <ul className="mt-2 space-y-1.5 text-sm">
+            {preview.map((c) => (
+              <li key={c.key} className="flex items-start gap-2 text-amber-800"><Icon name="AlertTriangle" className="mt-0.5 h-4 w-4 shrink-0" />
+                <span><b>{c.a.name}</b> ({c.a.ovenTemp}°F) and <b>{c.b.name}</b> ({c.b.ovenTemp}°F) would ideally bake at the same time — {c.diff}°F apart. We'll ask how to handle it.</span></li>
+            ))}
+          </ul>
+        )}
+        <div className="mt-5 flex flex-wrap items-center gap-3">
+          <button className={btn.primary + ' !px-6 !py-3 !text-base'} disabled={!recipes.length} onClick={onGenerate}><Icon name="Wand2" className="h-5 w-5" />Build my master plan</button>
+          {!recipes.length && <span className="text-sm text-stone-500">Add at least one recipe first.</span>}
+        </div>
+      </Card>
+    </div>
+  );
+}
+
+/* ================================================================
+   Step 4 – Plan: alerts, Gantt, checklist, exports
+   ================================================================ */
+function AlertsPanel({ alerts, onAction }) {
+  const [open, setOpen] = useState(true);
+  if (!alerts.length) return null;
+  const style = {
+    error: ['bg-red-50 border-red-200 text-red-900', 'AlertTriangle', 'text-red-600'],
+    conflict: ['bg-amber-50 border-amber-200 text-amber-950', 'Thermometer', 'text-amber-600'],
+    warning: ['bg-amber-50 border-amber-200 text-amber-950', 'AlertTriangle', 'text-amber-600'],
+    info: ['bg-sky-50 border-sky-200 text-sky-950', 'Info', 'text-sky-600'],
+  };
+  const sorted = [...alerts].sort((a, b) => ['error', 'conflict', 'warning', 'info'].indexOf(a.severity) - ['error', 'conflict', 'warning', 'info'].indexOf(b.severity));
+  const serious = alerts.filter((a) => a.severity !== 'info').length;
+  return (
+    <Card className="p-4 print:hidden">
+      <button className="flex w-full items-center justify-between text-left" onClick={() => setOpen((o) => !o)}>
+        <span className="flex items-center gap-2 font-semibold"><Icon name="AlertTriangle" className={`h-4 w-4 ${serious ? 'text-amber-600' : 'text-sky-600'}`} />
+          Smart conflict check · {serious ? `${serious} item${serious > 1 ? 's' : ''} to look at` : 'all clear'} <span className="font-normal text-stone-500">({alerts.length} notes)</span></span>
+        <Icon name={open ? 'ChevronUp' : 'ChevronDown'} className="h-4 w-4 text-stone-500" />
+      </button>
+      {open && (
+        <div className="mt-3 space-y-2">
+          {sorted.map((a) => {
+            const [cls, ic, icCls] = style[a.severity];
+            return (
+              <div key={a.id} className={`rounded-xl border p-3 ${cls}`}>
+                <div className="flex items-start gap-2">
+                  <Icon name={ic} className={`mt-0.5 h-4 w-4 shrink-0 ${icCls}`} />
+                  <div className="min-w-0 flex-1">
+                    <div className="text-sm font-semibold">{a.title}</div>
+                    <div className="mt-0.5 text-sm opacity-90">{a.body}</div>
+                    {a.actions?.length > 0 && (
+                      <div className="mt-2 flex flex-wrap gap-2">
+                        {a.actions.map((x) => (
+                          <button key={x.label} className="rounded-lg border border-current/20 bg-white/80 px-2.5 py-1 text-xs font-semibold hover:bg-white" title={x.hint} onClick={() => onAction(x.action)}>
+                            {x.label}{x.hint && <span className="ml-1 font-normal opacity-70">· {x.hint}</span>}
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </Card>
+  );
+}
+
+function Gantt({ plan }) {
+  const base = new Date(plan.base);
+  const serveDay = atMin(base, plan.serveAt);
+  const wrapRef = useRef();
+  const [width, setWidth] = useState(900);
+  const [zoom, setZoom] = useState('fit');
+  const [now, setNow] = useState(Date.now());
+  useEffect(() => {
+    const ro = new ResizeObserver(([e]) => setWidth(e.contentRect.width));
+    if (wrapRef.current) ro.observe(wrapRef.current);
+    const t = setInterval(() => setNow(Date.now()), 30000);
+    return () => { ro.disconnect(); clearInterval(t); };
+  }, []);
+  const labelW = width < 640 ? 110 : 190;
+  const t0 = floorTo(plan.t0, 30), t1 = ceilTo(plan.t1 + 20, 30);
+  const span = t1 - t0;
+  const ppm = zoom === 'fit' ? Math.max(0.35, (width - labelW - 12) / span) : zoom;
+  const inner = span * ppm;
+  const tickStep = ppm * 60 < 70 ? 120 : ppm * 30 < 60 ? 60 : ppm * 15 < 60 ? 30 : 15;
+  const ticks = [];
+  for (let t = ceilTo(t0, tickStep); t <= t1; t += tickStep) ticks.push(t);
+  const X = (t) => (t - t0) * ppm;
+  const nowMin = (now - plan.base) / 60000;
+  const laneH = 26;
+  return (
+    <div>
+      <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+        <div className="flex flex-wrap gap-x-3 gap-y-1">
+          {Object.entries(PHASES).map(([k, p]) => <span key={k} className="inline-flex items-center gap-1.5 text-xs text-stone-600"><span className={`h-3 w-3 rounded ${p.cls}`} />{p.label}</span>)}
+        </div>
+        <div className="flex overflow-hidden rounded-lg border border-stone-300 text-xs font-semibold">
+          {[['fit', 'Fit'], [2, 'Zoom'], [4, 'Detail']].map(([z, l]) => (
+            <button key={l} className={`px-3 py-1.5 ${zoom === z ? 'bg-stone-800 text-white' : 'bg-white text-stone-600 hover:bg-stone-50'}`} onClick={() => setZoom(z)}>{l}</button>
+          ))}
+        </div>
+      </div>
+      <div ref={wrapRef} className="overflow-x-auto rounded-xl border border-stone-200 scroll-thin">
+        <div style={{ width: labelW + inner }} className="relative">
+          <div className="sticky top-0 z-20 flex border-b border-stone-200 bg-white">
+            <div className="sticky left-0 z-10 shrink-0 bg-white" style={{ width: labelW }} />
+            <div className="relative h-8" style={{ width: inner }}>
+              {ticks.map((t) => <span key={t} className="absolute top-2 -translate-x-1/2 whitespace-nowrap text-[11px] font-medium text-stone-500" style={{ left: Math.max(X(t), 28) }}>{fmtClock(atMin(base, t))}</span>)}
+            </div>
+          </div>
+          {plan.rows.map((row, i) => (
+            <div key={row.key} className={`flex border-b border-stone-100 ${row.lane ? 'bg-stone-50/70' : i % 2 ? 'bg-stone-50/30' : ''}`}>
+              <div className="sticky left-0 z-10 flex shrink-0 items-center gap-2 border-r border-stone-200 bg-inherit px-3 py-1.5 backdrop-blur" style={{ width: labelW, background: row.lane ? '#fafaf9' : '#fff' }}>
+                {row.color ? <span className="h-2.5 w-2.5 shrink-0 rounded-full" style={{ background: row.color }} /> : <Icon name={row.key === 'serve' ? 'Utensils' : 'Flame'} className="h-3.5 w-3.5 shrink-0 text-stone-400" />}
+                <div className="min-w-0"><div className="truncate text-xs font-semibold sm:text-sm">{row.label}</div><div className="truncate text-[10px] text-stone-400 sm:text-xs">{row.sub}</div></div>
+              </div>
+              <div className="relative" style={{ width: inner, height: row.lanes * laneH + 10 }}>
+                {ticks.map((t) => <div key={t} className="absolute inset-y-0 w-px bg-stone-100" style={{ left: X(t) }} />)}
+                {row.items.map((it, j) => {
+                  const w = Math.max(3, (it.end - it.start) * ppm);
+                  return (
+                    <div key={j} title={it.tip}
+                      className={`absolute flex items-center overflow-hidden whitespace-nowrap rounded-md px-1.5 text-[11px] font-semibold shadow-sm ${PHASES[it.kind].cls} ${it.adjusted ? 'ring-2 ring-amber-300 ring-offset-1' : ''}`}
+                      style={{ left: X(it.start), width: w, top: 5 + it.lane * laneH, height: laneH - 5 }}>
+                      {w > 30 && it.label}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          ))}
+          <div className="pointer-events-none absolute bottom-0 top-8 w-0.5 bg-emerald-600/70" style={{ left: labelW + X(plan.serveAt) }} />
+          {nowMin > t0 && nowMin < t1 && (
+            <div className="pointer-events-none absolute bottom-0 top-0 z-30 w-0.5 bg-red-500" style={{ left: labelW + X(nowMin) }}>
+              <span className="absolute -left-4 top-0 rounded bg-red-500 px-1 text-[10px] font-bold text-white">NOW</span>
+            </div>
+          )}
+        </div>
+      </div>
+      <p className="mt-2 text-xs text-stone-500">Hover a bar for exact times. Amber-outlined bakes were nudged to share an oven. Green line = {plan.anchorMode === 'target' ? 'serving time' : 'finish'} ({fmtAt(base, plan.serveAt, serveDay)}).</p>
+    </div>
+  );
+}
+
+function Checklist({ plan, checked, setChecked }) {
+  const base = new Date(plan.base);
+  const serveDay = atMin(base, plan.serveAt);
+  const [filter, setFilter] = useState('all');
+  const [hideDone, setHideDone] = useState(false);
+  const done = plan.events.filter((e) => checked[e.id]).length;
+  const nextId = plan.events.find((e) => !checked[e.id])?.id;
+  const visible = plan.events.filter((e) => (filter === 'all' || e.recipeId === filter || (filter === 'oven' && e.kind === 'oven')) && !(hideDone && checked[e.id]));
+  const pct = Math.round((done / Math.max(1, plan.events.length)) * 100);
+  return (
+    <div>
+      <div className="mb-3 flex flex-wrap items-center gap-3">
+        <div className="min-w-[200px] flex-1">
+          <div className="flex justify-between text-xs font-medium text-stone-500"><span>{done} of {plan.events.length} steps done</span><span>{pct}%</span></div>
+          <div className="mt-1 h-2 overflow-hidden rounded-full bg-stone-100"><div className="h-full rounded-full bg-emerald-500 transition-all" style={{ width: `${pct}%` }} /></div>
+        </div>
+        <select className={inputCls + ' !w-auto'} value={filter} onChange={(e) => setFilter(e.target.value)} aria-label="Filter steps">
+          <option value="all">All steps</option><option value="oven">Oven only</option>
+          {plan.order.map((id) => <option key={id} value={id}>{plan.recipes[id].name}</option>)}
+        </select>
+        <label className="flex items-center gap-2 text-sm text-stone-600"><input type="checkbox" checked={hideDone} onChange={(e) => setHideDone(e.target.checked)} className="accent-orange-600" />Hide done</label>
+        <button className={btn.ghost} onClick={() => setChecked({})}><Icon name="RotateCcw" />Reset</button>
+      </div>
+      <ol className="divide-y divide-stone-100 rounded-xl border border-stone-200">
+        {visible.map((e) => {
+          const isDone = !!checked[e.id];
+          const isNext = e.id === nextId;
+          const big = e.kind === 'serve';
+          return (
+            <li key={e.id}>
+              <label className={`flex cursor-pointer items-start gap-3 px-3 py-2.5 transition hover:bg-orange-50/50 ${isNext ? 'bg-orange-50 ring-1 ring-inset ring-orange-300' : ''} ${big ? 'bg-emerald-50' : ''}`}>
+                <span className="w-24 shrink-0 pt-0.5 text-right text-sm font-semibold tabular text-stone-500 sm:w-28">{fmtAt(base, e.t, serveDay)}</span>
+                <input type="checkbox" className="mt-1 h-4 w-4 shrink-0 accent-emerald-600" checked={isDone} onChange={() => setChecked((c) => ({ ...c, [e.id]: !c[e.id] }))} />
+                <span className="mt-1.5 h-2.5 w-2.5 shrink-0 rounded-full" style={{ background: EVENT_DOT[e.kind] }} />
+                <span className={`min-w-0 flex-1 ${isDone ? 'text-stone-400 line-through' : ''}`}>
+                  <span className={`block text-sm ${big ? 'text-base font-bold text-emerald-800' : 'font-semibold'}`}>{e.text}{isNext && !isDone && <span className="ml-2 rounded bg-orange-600 px-1.5 py-0.5 text-[10px] font-bold uppercase text-white no-underline">next</span>}</span>
+                  {e.detail && <span className="block text-xs text-stone-500">{e.detail}</span>}
+                </span>
+              </label>
+            </li>
+          );
+        })}
+        {!visible.length && <li className="p-6 text-center text-sm text-stone-500">Nothing to show with these filters.</li>}
+      </ol>
+    </div>
+  );
+}
+
+function PlanStep({ plan, stale, onRebuild, checked, setChecked, onAction, toast }) {
+  const [tab, setTab] = useState('timeline');
+  const [busy, setBusy] = useState('');
+  if (!plan) return null;
+  const base = new Date(plan.base);
+  const serveDay = atMin(base, plan.serveAt);
+  const stats = [
+    ['Play', 'Start', fmtAt(base, plan.t0, serveDay)],
+    [plan.anchorMode === 'target' ? 'Target' : 'Flag', plan.anchorMode === 'target' ? 'Serve' : 'Finish', fmtAt(base, plan.serveAt, serveDay)],
+    ['Clock', 'Total time', fmtDur(plan.stats.total)],
+    ['Hand', 'Hands-on', fmtDur(plan.stats.handsOn)],
+    ['Flame', 'Oven time', fmtDur(plan.stats.ovenMin)],
+    ['ListChecks', 'Steps', plan.stats.steps],
+  ];
+  const run = async (key, fn) => { setBusy(key); try { await fn(); } catch (e) { toast(e.message || 'Export failed', 'error'); } setBusy(''); };
+  return (
+    <div className="space-y-5">
+      <div className="flex flex-wrap items-end justify-between gap-3">
+        <div>
+          <h2 className="text-2xl font-bold tracking-tight">Your master plan</h2>
+          <p className="mt-1 text-stone-600">{serveDay.toLocaleDateString([], { weekday: 'long', month: 'long', day: 'numeric' })} · {STRATEGIES[plan.strategy].label} mode · {plan.settings.ovens} oven{plan.settings.ovens === 1 ? '' : 's'}, {plan.settings.burners} burners, {plan.settings.cooks} cook{plan.settings.cooks === 1 ? '' : 's'}</p>
+        </div>
+        <div className="flex flex-wrap gap-2 print:hidden">
+          <button className={btn.secondary} onClick={() => exportCSV(plan, checked)}><Icon name="FileText" />CSV</button>
+          <button className={btn.secondary} disabled={busy === 'x'} onClick={() => run('x', () => exportXLSX(plan, checked))}><Icon name={busy === 'x' ? 'Loader2' : 'FileSpreadsheet'} className={`h-4 w-4 ${busy === 'x' ? 'animate-spin' : ''}`} />Excel</button>
+          <button className={btn.secondary} onClick={() => exportPNG(plan)}><Icon name="ImageDown" />Graphic</button>
+          <button className={btn.secondary} onClick={() => window.print()}><Icon name="Printer" />Print / PDF</button>
+        </div>
+      </div>
+      {stale && (
+        <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-orange-200 bg-orange-50 px-4 py-3 print:hidden">
+          <span className="flex items-center gap-2 text-sm font-medium text-orange-900"><Icon name="Info" />Recipes or settings changed since this plan was built.</span>
+          <button className={btn.primary + ' !py-1.5'} onClick={onRebuild}><Icon name="RotateCcw" />Rebuild plan</button>
+        </div>
+      )}
+      <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
+        {stats.map(([ic, l, v]) => (
+          <Card key={l} className="p-3">
+            <div className="flex items-center gap-1.5 text-xs font-medium text-stone-500"><Icon name={ic} className="h-3.5 w-3.5" />{l}</div>
+            <div className="mt-1 text-lg font-bold tabular">{v}</div>
+          </Card>
+        ))}
+      </div>
+      <AlertsPanel alerts={plan.alerts} onAction={onAction} />
+      <Card className="p-4">
+        <div className="mb-4 flex gap-1 rounded-xl bg-stone-100 p-1 sm:w-fit">
+          {[['timeline', 'GanttChart', 'Timeline'], ['checklist', 'ListChecks', 'Checklist']].map(([k, ic, l]) => (
+            <button key={k} onClick={() => setTab(k)} className={`flex flex-1 items-center justify-center gap-2 rounded-lg px-4 py-2 text-sm font-semibold transition sm:flex-none ${tab === k ? 'bg-white text-stone-900 shadow-sm' : 'text-stone-500 hover:text-stone-800'}`}>
+              <Icon name={ic} />{l}
+            </button>
+          ))}
+        </div>
+        {tab === 'timeline' ? <Gantt plan={plan} /> : <Checklist plan={plan} checked={checked} setChecked={setChecked} />}
+      </Card>
+    </div>
+  );
+}
+
+/* Print-only clean view (used for "Print / PDF") */
+function PrintView({ plan, checked }) {
+  if (!plan) return null;
+  const base = new Date(plan.base);
+  const serveDay = atMin(base, plan.serveAt);
+  return (
+    <div className="hidden p-2 text-[11px] text-black print:block">
+      <div className="flex items-end justify-between border-b-2 border-black pb-2">
+        <div><div className="text-2xl font-extrabold">Kitchen Sync · Master Plan</div>
+          <div className="text-sm">{serveDay.toLocaleDateString([], { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' })} · {STRATEGIES[plan.strategy].label} mode</div></div>
+        <div className="text-right text-sm"><div>Start <b>{fmtAt(base, plan.t0, serveDay)}</b></div><div>{plan.anchorMode === 'target' ? 'Serve' : 'Finish'} <b>{fmtAt(base, plan.serveAt, serveDay)}</b> · {fmtDur(plan.stats.total)}</div></div>
+      </div>
+      <div className="mt-3 grid grid-cols-2 gap-x-6 gap-y-1">
+        {plan.order.map((id) => { const r = plan.recipes[id]; return (
+          <div key={id} className="break-inside-avoid"><b>{r.name}</b> <span className="text-stone-600">({r.category})</span> — prep {r.prepTime}m{r.waitTime ? `, ${r.waitLabel.toLowerCase()} ${r.waitTime}m` : ''}{r.activeTime ? `, active ${r.activeTime}m` : ''}{r.passiveTime ? `, ${r.passiveWhere === 'oven' ? `bake ${r.ovenTemp}°F` : r.passiveWhere} ${r.passiveTime}m${r.batches > 1 ? `×${r.batches}` : ''}` : ''}{r.restTime ? `, rest ${r.restTime}m` : ''}</div>
+        ); })}
+      </div>
+      {plan.alerts.filter((a) => a.severity !== 'info').length > 0 && (
+        <div className="mt-3 rounded border border-black p-2">
+          <b>Heads up:</b>
+          <ul className="list-disc pl-4">{plan.alerts.filter((a) => a.severity !== 'info').map((a) => <li key={a.id}>{a.title}</li>)}</ul>
+        </div>
+      )}
+      <table className="mt-3 w-full border-collapse">
+        <thead><tr className="border-b border-black text-left"><th className="w-6 py-1">✓</th><th className="w-24">Time</th><th>Step</th></tr></thead>
+        <tbody>
+          {plan.events.map((e) => (
+            <tr key={e.id} className="break-inside-avoid border-b border-stone-300 align-top">
+              <td className="py-1"><span className="inline-block h-3 w-3 border border-black text-center leading-3">{checked[e.id] ? '✓' : ''}</span></td>
+              <td className="py-1 font-semibold">{fmtAt(base, e.t, serveDay)}</td>
+              <td className="py-1"><b>{e.text}</b>{e.detail && <div className="text-stone-700">{e.detail}</div>}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+/* ================================================================
+   Clarifying questions modal
+   ================================================================ */
+function ClarifyModal({ data, onApply, onClose }) {
+  const [vals, setVals] = useState(() => Object.fromEntries(data.questions.map((q) => [q.key, q.value])));
+  const groups = [
+    ['error', 'Needed to build your plan', 'AlertTriangle', 'text-red-600'],
+    ['conflict', 'Oven conflicts', 'Thermometer', 'text-amber-600'],
+    ['review', "Couldn't find these in your files", 'HelpCircle', 'text-sky-600'],
+    ['warning', 'Worth double-checking', 'Info', 'text-amber-600'],
+  ];
+  const missing = data.questions.filter((q) => q.severity === 'error' && (vals[q.key] === '' || vals[q.key] == null));
+  return (
+    <Modal title={data.mode === 'import' ? 'A few quick questions about your recipes' : 'Before we build your plan…'} icon="HelpCircle" onClose={onClose}
+      footer={<>
+        <button className={btn.secondary} onClick={onClose}>{data.mode === 'import' ? 'Skip for now' : 'Go back'}</button>
+        <button className={btn.primary} disabled={missing.length > 0} onClick={() => onApply(vals)}><Icon name="Check" />{data.mode === 'import' ? 'Save answers' : 'Apply & build plan'}</button>
+      </>}>
+      <div className="space-y-5">
+        {groups.map(([sev, title, ic, icCls]) => {
+          const qs = data.questions.filter((q) => q.severity === sev);
+          if (!qs.length) return null;
+          return (
+            <div key={sev}>
+              <div className="mb-2 flex items-center gap-2 text-xs font-bold uppercase tracking-wide text-stone-500"><Icon name={ic} className={`h-4 w-4 ${icCls}`} />{title}</div>
+              <div className="space-y-3">
+                {qs.map((q) => (
+                  <div key={q.key} className="rounded-xl border border-stone-200 p-3">
+                    <div className="text-sm font-medium">{q.q}</div>
+                    <div className="mt-2">
+                      {q.input === 'number' && (
+                        <div className="relative w-40"><input type="number" className={inputCls + ' pr-10'} value={vals[q.key]} onChange={(e) => setVals((v) => ({ ...v, [q.key]: e.target.value }))} />
+                          {q.unit && <span className="absolute right-3 top-1/2 -translate-y-1/2 text-xs text-stone-400">{q.unit}</span>}</div>
+                      )}
+                      {q.input === 'text' && <input className={inputCls} value={vals[q.key]} onChange={(e) => setVals((v) => ({ ...v, [q.key]: e.target.value }))} />}
+                      {q.input === 'datetime' && <input type="datetime-local" className={inputCls + ' sm:w-64'} value={vals[q.key]} onChange={(e) => setVals((v) => ({ ...v, [q.key]: e.target.value }))} />}
+                      {q.input === 'select' && (
+                        <select className={inputCls + ' sm:w-56'} value={vals[q.key]} onChange={(e) => setVals((v) => ({ ...v, [q.key]: e.target.value }))}>{q.options.map((o) => <option key={o}>{o}</option>)}</select>
+                      )}
+                      {q.input === 'choice' && (
+                        <div className="space-y-1.5">
+                          {q.options.map((o) => (
+                            <label key={o.value} className={`flex cursor-pointer items-center gap-2 rounded-lg border px-3 py-2 text-sm ${vals[q.key] === o.value ? 'border-orange-400 bg-orange-50' : 'border-stone-200 hover:bg-stone-50'}`}>
+                              <input type="radio" name={q.key} className="accent-orange-600" checked={vals[q.key] === o.value} onChange={() => setVals((v) => ({ ...v, [q.key]: o.value }))} />{o.label}
+                            </label>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </Modal>
+  );
+}
+
+/* ================================================================
+   App
+   ================================================================ */
+const STEPS = [
+  { key: 'kitchen', label: 'Kitchen', icon: 'Flame' },
+  { key: 'recipes', label: 'Recipes', icon: 'ChefHat' },
+  { key: 'schedule', label: 'Schedule', icon: 'CalendarClock' },
+  { key: 'plan', label: 'Master Plan', icon: 'ListChecks' },
+];
+function defaultSettings() {
+  const d = new Date(); d.setHours(17, 0, 0, 0);
+  return { ovens: 1, racks: 2, burners: 4, cooks: 1, anchor: 'target', time: toLocalInput(d), strategy: 'express', buffer: 10, equipment: {} };
+}
+
+function App() {
+  const [step, setStep] = useState(() => store.get('ks.step', 0));
+  const [recipes, setRecipes] = useState(() => store.get('ks.recipes', []).map((r) => ({ ...normalizeRecipe(r), _review: r._review })));
+  const [settings, setSettings] = useState(() => ({ ...defaultSettings(), ...store.get('ks.settings', {}) }));
+  const [plan, setPlan] = useState(() => store.get('ks.plan', null));
+  const [planKey, setPlanKey] = useState(() => store.get('ks.planKey', ''));
+  const [checked, setChecked] = useState(() => store.get('ks.checked', {}));
+  const [editing, setEditing] = useState(null);
+  const [clarify, setClarify] = useState(null);
+  const [dismissed, setDismissed] = useState([]);
+  const [busy, setBusy] = useState(false);
+  const [progress, setProgress] = useState('');
+  const [toasts, setToasts] = useState([]);
+  const [ai, setAi] = useState(() => store.get('ks.ai', { key: '', enabled: true }));
+  const [hosted, setHosted] = useState({ enabled: false });
+
+  useEffect(() => store.set('ks.ai', ai), [ai]);
+  useEffect(() => { fetchAIStatus().then(setHosted); }, []);
+  useEffect(() => store.set('ks.recipes', recipes), [recipes]);
+  useEffect(() => store.set('ks.settings', settings), [settings]);
+  useEffect(() => store.set('ks.checked', checked), [checked]);
+  useEffect(() => store.set('ks.step', step), [step]);
+  useEffect(() => { store.set('ks.plan', plan); store.set('ks.planKey', planKey); }, [plan, planKey]);
+
+  const toast = (msg, kind = 'ok') => {
+    const id = uid();
+    setToasts((t) => [...t, { id, msg, kind }]);
+    setTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), 4500);
+  };
+  const currentKey = JSON.stringify({ r: recipes.map(({ _review, ...r }) => r), s: settings });
+  const stale = !!plan && planKey !== currentKey;
+
+  const build = (rs = recipes, st = settings) => {
+    const clean = rs.map(({ _review, ...r }) => r);
+    const p = generatePlan(clean, st);
+    setPlan(p);
+    setPlanKey(JSON.stringify({ r: clean, s: st }));
+    setStep(3);
+    const issues = p.alerts.filter((a) => a.severity !== 'info').length;
+    toast(issues ? `Plan ready – ${issues} item${issues > 1 ? 's' : ''} worth a look` : 'Plan ready – no conflicts!');
+  };
+
+  const requestBuild = () => {
+    if (!recipes.length) { toast('Add at least one recipe first', 'error'); setStep(1); return; }
+    const qs = [...validate(recipes, settings, dismissed), ...reviewQuestions(recipes)];
+    if (qs.length) setClarify({ mode: 'build', questions: qs });
+    else build();
+  };
+
+  const applyAnswers = (vals) => {
+    let rs = recipes.map((r) => ({ ...r }));
+    let st = { ...settings };
+    const newlyDismissed = [];
+    for (const q of clarify.questions) {
+      const v = vals[q.key];
+      if (q.dismissKey) newlyDismissed.push(q.dismissKey);
+      if (q.input === 'choice') {
+        if (v === 'compromise') rs = applyCompromise(rs, q.conflict.ids, q.conflict.temp);
+        if (v === 'addOven') st.ovens = Math.min(4, st.ovens + 1);
+        continue;
+      }
+      const val = q.input === 'number' ? int0(v) : v;
+      if (q.recipeId) rs = rs.map((r) => (r.id === q.recipeId ? { ...r, [q.field]: val, ...(q.field === 'ovenTemp' && val > 0 && r.passiveWhere !== 'oven' && r.passiveTime > 0 ? { passiveWhere: 'oven' } : {}) } : r));
+      else st[q.field] = val;
+    }
+    const reviewed = new Set(clarify.questions.filter((q) => q.severity === 'review').map((q) => q.recipeId));
+    rs = rs.map((r) => (reviewed.has(r.id) ? (({ _review, ...x }) => x)(r) : r));
+    const dis = [...dismissed, ...newlyDismissed];
+    setRecipes(rs); setSettings(st); setDismissed(dis);
+    const mode = clarify.mode;
+    setClarify(null);
+    if (mode === 'build') {
+      const remaining = validate(rs, st, dis).filter((q) => q.severity === 'error');
+      if (remaining.length) setClarify({ mode: 'build', questions: remaining });
+      else build(rs, st);
+    } else toast('Thanks – recipes updated');
+  };
+
+  const onImport = async (files, pasted) => {
+    setBusy(true);
+    const added = [], failed = [], aiProblems = [];
+    let useAI = ai.enabled && (!!ai.key || (hosted.enabled && hosted.remaining > 0)), aiCount = 0;
+    // Try Claude first; fall back to the basic reader if AI is off or the request fails.
+    const read = async (label, viaAI, viaBasic) => {
+      if (useAI) {
+        try {
+          setProgress(`Claude is reading ${label}…`);
+          const { recipes: rs, remaining } = await viaAI();
+          if (remaining != null) setHosted((h) => ({ ...h, remaining }));
+          aiCount += rs.length;
+          return rs;
+        } catch (e) {
+          console.error(e);
+          aiProblems.push(e.message);
+          if (e.remaining != null) setHosted((h) => ({ ...h, remaining: e.remaining }));
+          if (e.fatal) useAI = false;
+        }
+      }
+      return viaBasic();
+    };
+    try {
+      if (pasted) added.push(...await read('your pasted text', () => aiReadText(pasted, ai.key), async () => splitAndParse(pasted, 'Pasted recipe')));
+      for (const f of files || []) {
+        try {
+          const rs = await read(f.name, () => aiReadFile(f, ai.key), () => importFile(f, setProgress));
+          if (!rs.length) failed.push(f.name);
+          added.push(...rs);
+        } catch (e) { console.error(e); failed.push(f.name); }
+      }
+    } finally { setBusy(false); setProgress(''); }
+    if (aiProblems.length) toast(`AI reading problem – used the basic reader instead. ${[...new Set(aiProblems)][0]}`, 'error');
+    if (failed.length) toast(`No recipe found in: ${failed.join(', ')}`, 'error');
+    if (!added.length) return;
+    setRecipes((rs) => [...rs, ...added]);
+    toast(`Imported ${added.length} recipe${added.length > 1 ? 's' : ''}${aiCount ? ` (${aiCount} read by Claude)` : ''}`);
+    const qs = reviewQuestions(added);
+    if (qs.length) setClarify({ mode: 'import', questions: qs });
+  };
+
+  const onLoadSample = (set, mode) => {
+    const fresh = set.recipes.map((r) => normalizeRecipe({ ...r, id: uid() }));
+    setRecipes((rs) => (mode === 'replace' ? fresh : [...rs, ...fresh]));
+    if (mode === 'replace') {
+      const d = fromLocalInput(settings.time) || new Date();
+      d.setHours(set.anchor.h, set.anchor.m, 0, 0);
+      setSettings((s) => ({ ...s, anchor: set.anchor.mode, time: toLocalInput(d) }));
+      setDismissed([]);
+      toast(`Loaded “${set.name}” – ${set.anchor.mode === 'target' ? 'ready by' : 'starting at'} ${fmtClock(d)}`);
+    } else toast(`Added ${fresh.length} recipes`);
+  };
+
+  const onAction = (a) => {
+    let rs = recipes, st = settings;
+    if (a.type === 'compromise') rs = applyCompromise(recipes, a.ids, a.temp);
+    if (a.type === 'addOven') st = { ...settings, ovens: Math.min(4, settings.ovens + 1) };
+    if (a.type === 'express') st = { ...settings, strategy: 'express' };
+    setRecipes(rs); setSettings(st);
+    build(rs, st);
+  };
+
+  const saveRecipe = (r) => {
+    setRecipes((rs) => (rs.some((x) => x.id === r.id) ? rs.map((x) => (x.id === r.id ? r : x)) : [...rs, r]));
+    setEditing(null);
+  };
+
+  const canGo = (i) => i < 3 || !!plan;
+  return (
+    <>
+      <div className="min-h-screen print:hidden">
+        <header className="sticky top-0 z-40 border-b border-stone-200 bg-white/85 backdrop-blur">
+          <div className="mx-auto flex max-w-7xl items-center gap-3 px-4 py-3">
+            <div className="grid h-10 w-10 place-items-center rounded-xl bg-gradient-to-br from-orange-500 to-red-600 text-white shadow"><Icon name="ChefHat" className="h-5 w-5" /></div>
+            <div className="mr-auto">
+              <div className="text-lg font-extrabold leading-tight tracking-tight">Kitchen Sync</div>
+              <div className="hidden text-xs text-stone-500 sm:block">Multi-recipe cooking & baking planner</div>
+            </div>
+            {plan && step !== 3 && <button className={btn.secondary + ' hidden sm:inline-flex'} onClick={() => setStep(3)}><Icon name="ListChecks" />View plan</button>}
+          </div>
+          <nav className="mx-auto max-w-7xl px-4 pb-3" aria-label="Steps">
+            <ol className="flex items-center gap-1 sm:gap-2">
+              {STEPS.map((s, i) => (
+                <li key={s.key} className="flex flex-1 items-center gap-1 sm:gap-2">
+                  <button disabled={!canGo(i)} onClick={() => setStep(i)}
+                    className={`flex w-full items-center justify-center gap-2 rounded-xl px-2 py-2 text-xs font-semibold transition sm:justify-start sm:px-3 sm:text-sm ${step === i ? 'bg-orange-600 text-white shadow-sm' : canGo(i) ? 'bg-stone-100 text-stone-600 hover:bg-stone-200' : 'bg-stone-50 text-stone-300'}`}>
+                    <span className={`grid h-6 w-6 shrink-0 place-items-center rounded-full text-xs ${step === i ? 'bg-white/20' : 'bg-white'}`}>{i < step ? <Icon name="Check" className="h-3.5 w-3.5" /> : i + 1}</span>
+                    <span className="hidden sm:inline">{s.label}</span>
+                  </button>
+                  {i < STEPS.length - 1 && <Icon name="ChevronRight" className="hidden h-4 w-4 shrink-0 text-stone-300 md:block" />}
+                </li>
+              ))}
+            </ol>
+          </nav>
+        </header>
+
+        <main className="mx-auto max-w-7xl px-4 py-6 sm:py-8">
+          {step === 0 && <KitchenStep settings={settings} setSettings={setSettings} recipes={recipes} />}
+          {step === 1 && <RecipesStep recipes={recipes} setRecipes={setRecipes} onEdit={setEditing} onImport={onImport} busy={busy} progress={progress} onLoadSample={onLoadSample} ai={ai} setAi={setAi} hosted={hosted} />}
+          {step === 2 && <ScheduleStep settings={settings} setSettings={setSettings} recipes={recipes} onGenerate={requestBuild} />}
+          {step === 3 && <PlanStep plan={plan} stale={stale} onRebuild={requestBuild} checked={checked} setChecked={setChecked} onAction={onAction} toast={toast} />}
+
+          {step < 3 && (
+            <div className="mt-8 flex items-center justify-between border-t border-stone-200 pt-5">
+              <button className={btn.secondary} disabled={step === 0} onClick={() => setStep(step - 1)}><Icon name="ChevronLeft" />Back</button>
+              {step < 2
+                ? <button className={btn.primary} onClick={() => setStep(step + 1)}>Next: {STEPS[step + 1].label}<Icon name="ChevronRight" /></button>
+                : <button className={btn.primary} disabled={!recipes.length} onClick={requestBuild}><Icon name="Wand2" />Build plan</button>}
+            </div>
+          )}
+          {step === 3 && (
+            <div className="mt-6 flex justify-between">
+              <button className={btn.secondary} onClick={() => setStep(2)}><Icon name="ChevronLeft" />Adjust settings</button>
+              <button className={btn.ghost} onClick={requestBuild}><Icon name="RotateCcw" />Rebuild</button>
+            </div>
+          )}
+        </main>
+        <footer className="mx-auto max-w-7xl px-4 pb-10 text-xs text-stone-400">
+          Oven model: preheat ≈20°F/min, cool-down ≈8°F/min with the door cracked; temperature nudges add ~10% time per 25°F. Your data stays in this browser.
+        </footer>
+      </div>
+
+      <PrintView plan={plan} checked={checked} />
+
+      {editing && <RecipeEditor recipe={editing} onSave={saveRecipe} onClose={() => setEditing(null)} />}
+      {clarify && <ClarifyModal key={clarify.questions.map((q) => q.key).join()} data={clarify} onApply={applyAnswers} onClose={() => setClarify(null)} />}
+
+      <div className="pointer-events-none fixed bottom-4 left-1/2 z-[60] flex w-[calc(100%-2rem)] max-w-sm -translate-x-1/2 flex-col gap-2 print:hidden">
+        {toasts.map((t) => (
+          <div key={t.id} className={`pointer-events-auto flex items-center gap-2 rounded-xl px-4 py-3 text-sm font-medium text-white shadow-lg ${t.kind === 'error' ? 'bg-red-600' : 'bg-stone-900'}`}>
+            <Icon name={t.kind === 'error' ? 'AlertTriangle' : 'CheckCircle2'} className="h-4 w-4 shrink-0" />{t.msg}
+          </div>
+        ))}
+      </div>
+    </>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>
