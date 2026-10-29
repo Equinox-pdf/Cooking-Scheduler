@@ -7,7 +7,6 @@
     "deploy": "vercel --prod"
   },
   "dependencies": {
-    "@anthropic-ai/sdk": "0.134.0",
     "@upstash/redis": "1.39.0"
   },
   "devDependencies": {

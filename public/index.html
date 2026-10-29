@@ -547,176 +547,28 @@ async function importFile(file, onProgress) {
 }
 
 /* ================================================================
-   AI recipe reading
-   Default: the Kitchen Sync server (api/ + lib/server.js on Vercel) calls Claude with the site owner's key.
-   Optional: a visitor's own Anthropic key, called directly from the browser via the official SDK.
-   The prompt + schema below are mirrored in lib/extraction.js – keep them in sync.
+   Server API (accounts + saved events, in api/ and lib/ on Vercel)
    ================================================================ */
-// Leave empty when this page is deployed together with the api/ folder. If you host the page somewhere else,
-// set it to the Vercel address (e.g. 'https://kitchen-sync.vercel.app') and add the page's origin to the
-// ALLOWED_ORIGINS environment variable in Vercel.
-const AI_SERVER = '';
-const serverAvailable = () => !!AI_SERVER || location.protocol.startsWith('http');
-const AI_MODEL = 'claude-opus-5-5';
-const ANTHROPIC_SDK_URL = 'https://cdn.jsdelivr.net/npm/@anthropic-ai/sdk@0.134.0/+esm';
-let sdkPromise = null;
-const loadAnthropic = () => (sdkPromise ||= import(ANTHROPIC_SDK_URL).then((m) => m.default || m.Anthropic).catch((e) => { sdkPromise = null; throw e; }));
-
-const REVIEWABLE = ['name', 'category', 'prepTime', 'activeTime', 'passiveTime', 'ovenTemp'];
-const minutes = (description) => ({ type: 'integer', description: description + ' Whole minutes; 0 if none.' });
-const AI_SCHEMA = {
-  type: 'object', additionalProperties: false, required: ['recipes'],
-  properties: {
-    recipes: {
-      type: 'array',
-      items: {
-        type: 'object', additionalProperties: false,
-        required: ['name', 'category', 'prepTime', 'waitTime', 'waitLabel', 'activeTime', 'activeOnStove', 'passiveTime', 'passiveWhere',
-          'ovenTemp', 'batches', 'fullOven', 'restTime', 'equipment', 'notes', 'concurrent', 'uncertainFields'],
-        properties: {
-          name: { type: 'string', description: 'Recipe title as written.' },
-          category: { type: 'string', enum: CATEGORIES },
-          prepTime: minutes('Hands-on prep before any cooking or chilling: chopping, measuring, mixing, assembling.'),
-          waitTime: minutes('Hands-off wait BEFORE cooking: chilling dough, rising/proofing, marinating, brining, soaking.'),
-          waitLabel: { type: 'string', description: 'Short label for the wait, e.g. "Chill dough", "Let dough rise", "Marinate". Empty if waitTime is 0.' },
-          activeTime: minutes('Hands-on cooking that needs attention: sautéing, stirring, searing, frying, flipping pancakes, rolling and cutting dough, boiling candy.'),
-          activeOnStove: { type: 'boolean', description: 'True if the active step uses a stovetop burner; false if it is counter work such as rolling or shaping.' },
-          passiveTime: minutes('Unattended cooking for ONE batch: oven bake/roast time (sum all stages, e.g. 15 min at 425°F + 45 min at 350°F = 60), a hands-off simmer, or time to set/chill in the fridge for no-cook dishes. Use the upper end of ranges.'),
-          passiveWhere: { type: 'string', enum: ['oven', 'stovetop', 'counter'], description: 'Where the passive step happens. counter = fridge/counter/no cooking.' },
-          ovenTemp: { type: 'integer', description: 'Oven temperature in °F (convert °C: F = C×9/5+32, round to 5). For multi-stage bakes use the temperature for the longest stage. 0 if no oven.' },
-          batches: { type: 'integer', description: 'Number of sequential oven loads/trays needed (e.g. 3 dozen cookies at 1 dozen per sheet = 3). 1 if everything bakes at once.' },
-          fullOven: { type: 'boolean', description: 'True only if the dish fills the whole oven (e.g. a large turkey).' },
-          restTime: minutes('After cooking and before serving: resting meat, cooling a pie or cookies, setting.'),
-          equipment: { type: 'array', items: { type: 'string' }, description: `Required equipment, using these names where they fit: ${KNOWN_EQUIPMENT.join(', ')}.` },
-          notes: { type: 'string', description: 'Concise ingredient list and key steps (under 900 characters), so the cook can follow along.' },
-          concurrent: { type: 'boolean', description: 'False only if the dish needs the oven to itself or constant attention (e.g. soufflé, candy at hard-crack).' },
-          uncertainFields: { type: 'array', items: { type: 'string', enum: REVIEWABLE }, description: 'Fields you had to guess because the recipe did not state them or the image was unreadable.' },
-        },
-      },
-    },
-  },
-};
-const AI_SYSTEM = `You read recipes (photos, scans, PDFs, web pages, or pasted text) and convert them into timing data for Kitchen Sync, a scheduler that plans several dishes around shared ovens, burners and one cook's hands.
-
-Split each recipe's time into: prep → wait (hands-off before cooking) → active (hands-on cooking) → passive (unattended oven/simmer/set) → rest. These must not overlap or double count: if a recipe states "Cook time 1 hr" and 10 minutes of that is sautéing before a 50-minute bake, active is 10 and passive is 50. Read the instructions, not just the header times, because header times are often wrong or lumped together. If a time is not stated, estimate it as an experienced cook would and list the field in uncertainFields.
-
-Return one entry per distinct recipe in the input; if the input has several recipes (e.g. a cookbook page), return them all. If there is no recipe at all, return an empty list.`;
-
-function blobToBase64(blob) {
-  return new Promise((resolve, reject) => {
-    const fr = new FileReader();
-    fr.onload = () => resolve(String(fr.result).split(',')[1]);
-    fr.onerror = () => reject(fr.error);
-    fr.readAsDataURL(blob);
-  });
-}
-/* Normalize any browser-readable image to a JPEG ≤ 2000px on the long edge (keeps requests small, text legible). */
-async function imageToJpeg(file) {
-  const url = URL.createObjectURL(file);
-  try {
-    const img = await new Promise((resolve, reject) => {
-      const i = new Image();
-      i.onload = () => resolve(i);
-      i.onerror = () => reject(new Error(`This browser can't open ${file.name} – try saving it as JPG or PNG.`));
-      i.src = url;
-    });
-    const scale = Math.min(1, 2000 / Math.max(img.naturalWidth, img.naturalHeight));
-    const canvas = document.createElement('canvas');
-    canvas.width = Math.round(img.naturalWidth * scale);
-    canvas.height = Math.round(img.naturalHeight * scale);
-    const g = canvas.getContext('2d');
-    g.fillStyle = '#fff'; g.fillRect(0, 0, canvas.width, canvas.height);
-    g.drawImage(img, 0, 0, canvas.width, canvas.height);
-    const blob = await new Promise((r) => canvas.toBlob(r, 'image/jpeg', 0.9));
-    return blobToBase64(blob);
-  } finally { URL.revokeObjectURL(url); }
-}
-async function fileToContentBlocks(file) {
-  const name = file.name || 'recipe';
-  const ext = (name.split('.').pop() || '').toLowerCase();
-  if (file.type.startsWith('image/') || ['png', 'jpg', 'jpeg', 'webp', 'bmp', 'gif', 'heic'].includes(ext)) {
-    return [{ type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: await imageToJpeg(file) } }];
-  }
-  if (ext === 'pdf' || file.type === 'application/pdf') {
-    if (file.size > 30 * 1024 * 1024) throw new Error(`${name} is over 30 MB – split it into smaller PDFs.`);
-    return [{ type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: await blobToBase64(file) } }];
-  }
-  let text = await file.text();
-  if (ext === 'html' || ext === 'htm' || /<html|<body/i.test(text)) text = htmlToText(text);
-  if (text.length > 400000) throw new Error(`${name} is too long for one request (${Math.round(text.length / 1000)}k characters) – split it into smaller files.`);
-  return [{ type: 'text', text: `File "${name}":\n\n${text}` }];
-}
-
-function recipesFromAI(list) {
-  return (list || []).map((r) => {
-    const { uncertainFields = [], ...rest } = r;
-    const recipe = normalizeRecipe({ ...rest, id: uid(), waitLabel: rest.waitLabel || 'Chill / rise' });
-    const review = uncertainFields.filter((f) => REVIEWABLE.includes(f));
-    if (review.length) recipe._review = [...new Set(review)];
-    return recipe;
-  });
-}
-async function fetchAIStatus() {
-  if (!serverAvailable()) return { enabled: false };
-  try {
-    const res = await fetch(`${AI_SERVER}/api/ai-status`, { cache: 'no-store' });
-    return res.ok ? await res.json() : { enabled: false };
-  } catch { return { enabled: false }; }
-}
-async function extractViaServer(blocks) {
-  const body = JSON.stringify({ blocks });
-  if (body.length > 4_400_000) throw new Error('That file is too large for AI reading (about 3 MB max) – split the PDF or use a smaller photo.');
+const serverAvailable = () => location.protocol.startsWith('http');
+async function api(path, { method = 'GET', body } = {}) {
   let res;
   try {
-    res = await fetch(`${AI_SERVER}/api/extract-recipes`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body });
+    res = await fetch(path, { method, credentials: 'same-origin', cache: 'no-store',
+      headers: body ? { 'Content-Type': 'application/json' } : {}, body: body ? JSON.stringify(body) : undefined });
   } catch { throw new Error('Could not reach the Kitchen Sync server – check your internet connection.'); }
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
     const err = new Error(data.error || `Server error ${res.status}`);
-    err.fatal = res.status === 429 || res.status === 503;
-    err.remaining = data.code === 'quota' ? 0 : undefined;
+    err.status = res.status; err.code = data.code;
     throw err;
   }
-  return { recipes: recipesFromAI(data.recipes), remaining: data.remaining };
+  return data;
 }
-async function extractWithKey(blocks, apiKey) {
-  const Anthropic = await loadAnthropic();
-  const client = new Anthropic({ apiKey, dangerouslyAllowBrowser: true, maxRetries: 2 });
-  let res;
-  try {
-    res = await client.beta.messages.create({
-      model: AI_MODEL,
-      max_tokens: 16000,
-      betas: ['server-side-fallback-2026-07-01'],
-      fallbacks: 'default',
-      output_config: { effort: 'medium', format: { type: 'json_schema', schema: AI_SCHEMA } },
-      system: AI_SYSTEM,
-      messages: [{ role: 'user', content: [...blocks, { type: 'text', text: 'Extract every recipe in this input for the Kitchen Sync scheduler.' }] }],
-    });
-  } catch (e) {
-    const err = new Error(
-      e instanceof Anthropic.AuthenticationError ? 'Your Anthropic API key was rejected – check it in AI settings.'
-      : e instanceof Anthropic.PermissionDeniedError ? 'This API key is not allowed to use Claude Opus 5.5.'
-      : e instanceof Anthropic.RateLimitError ? 'Rate limit reached – wait a minute and try again.'
-      : e instanceof Anthropic.BadRequestError ? `Claude couldn't accept this file: ${e.message}`
-      : e instanceof Anthropic.APIConnectionError ? 'Could not reach Anthropic – check your internet connection.'
-      : e instanceof Anthropic.APIError ? `Anthropic API error ${e.status}: ${e.message}`
-      : e.message || String(e));
-    err.fatal = e instanceof Anthropic.AuthenticationError || e instanceof Anthropic.PermissionDeniedError;
-    throw err;
-  }
-  if (res.stop_reason === 'refusal') throw new Error('Claude declined to read this file.');
-  if (res.stop_reason === 'max_tokens') throw new Error('The file has too many recipes for one pass – split it up.');
-  const text = res.content.filter((b) => b.type === 'text').map((b) => b.text).join('');
-  let data;
-  try { data = JSON.parse(text); } catch { throw new Error('Claude returned an unreadable answer – try again.'); }
-  return { recipes: recipesFromAI(data.recipes) };
+const SIGNED_OUT = { user: null, accounts: false };
+async function fetchMe() {
+  if (!serverAvailable()) return SIGNED_OUT;
+  try { return await api('/api/auth?action=me'); } catch { return SIGNED_OUT; }
 }
-/* A visitor's own key wins; otherwise the server is used. */
-const aiExtract = (blocks, apiKey) => (apiKey ? extractWithKey(blocks, apiKey) : extractViaServer(blocks));
-const aiReadFile = async (file, apiKey) => aiExtract(await fileToContentBlocks(file), apiKey);
-const aiReadText = (text, apiKey) => aiExtract([{ type: 'text', text }], apiKey);
-
 /* ================================================================
    Scheduler
    ================================================================ */
@@ -1393,56 +1245,156 @@ function KitchenStep({ settings, setSettings, recipes }) {
 /* ================================================================
    Step 2 – Recipes
    ================================================================ */
-function AISettings({ ai, setAi, hosted }) {
-  const [open, setOpen] = useState(false);
-  const [draft, setDraft] = useState('');
-  const available = !!ai.key || hosted.enabled;
-  const on = ai.enabled && available;
-  const sub = !on ? (available ? 'using the basic pattern reader' : 'add an API key to turn it on')
-    : ai.key ? 'Claude reads your files with your own API key'
-    : hosted.remaining > 0 ? `Claude reads your files · ${hosted.remaining} of ${hosted.limit} free imports left today`
-    : `today's ${hosted.limit} free imports are used up – basic reader until tomorrow`;
+/* ================================================================
+   Accounts & saved events
+   ================================================================ */
+function AuthModal({ initialMode = 'signin', onDone, onClose }) {
+  const [mode, setMode] = useState(initialMode);
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [show, setShow] = useState(false);
+  const [error, setError] = useState('');
+  const [busy, setBusy] = useState(false);
+  const signup = mode === 'signup';
+  const submit = async (e) => {
+    e.preventDefault();
+    setError('');
+    if (password.length < 6) { setError('Your password needs at least 6 characters.'); return; }
+    setBusy(true);
+    try {
+      const data = await api(`/api/auth?action=${signup ? 'signup' : 'signin'}`, { method: 'POST', body: { email, password } });
+      onDone(data.user, signup);
+    } catch (err) { setError(err.message); setBusy(false); }
+  };
   return (
-    <div className={`mt-4 rounded-xl border p-3 ${on ? 'border-violet-200 bg-violet-50' : 'border-stone-200 bg-stone-50'}`}>
-      <div className="flex flex-wrap items-center gap-2">
-        <Icon name="Sparkles" className={`h-4 w-4 ${on ? 'text-violet-600' : 'text-stone-400'}`} />
-        <span className="text-sm font-semibold">{on ? 'AI reading is on' : 'AI reading is off'}</span>
-        <span className="text-xs text-stone-500">{sub}</span>
-        <div className="ml-auto flex items-center gap-1">
-          {available && (
-            <label className="flex cursor-pointer items-center gap-1.5 text-xs font-medium text-stone-600">
-              <input type="checkbox" className="accent-violet-600" checked={ai.enabled} onChange={(e) => setAi({ ...ai, enabled: e.target.checked })} />Use AI
-            </label>
-          )}
-          <button className={btn.ghost + ' !text-xs'} onClick={() => setOpen((o) => !o)}>{open ? 'Hide' : available ? 'Settings' : 'Set up'}</button>
-        </div>
+    <Modal title={signup ? 'Create your account' : 'Sign in'} icon="Users" onClose={onClose}>
+      <div className="mb-4 flex gap-1 rounded-xl bg-stone-100 p-1">
+        {[['signin', 'Sign in'], ['signup', 'Create account']].map(([k, l]) => (
+          <button key={k} type="button" onClick={() => { setMode(k); setError(''); }}
+            className={`flex-1 rounded-lg py-2 text-sm font-semibold transition ${mode === k ? 'bg-white text-stone-900 shadow-sm' : 'text-stone-500 hover:text-stone-800'}`}>{l}</button>
+        ))}
       </div>
-      {open && (
-        <div className="mt-3 space-y-2 text-xs text-stone-600">
-          <p>AI reading understands handwriting, photos taken at an angle, multi-stage bakes and scattered timings far better than the basic reader.
-            {hosted.enabled
-              ? ' It’s included here with a daily allowance. If you have your own Anthropic API key, you can use it instead for unlimited imports, billed to your account.'
-              : <> It needs an Anthropic API key (create one at <a className="font-semibold text-violet-700 underline" href="https://console.anthropic.com/settings/keys" target="_blank" rel="noreferrer">console.anthropic.com</a>). Each recipe usually costs a few cents.</>}
-          </p>
-          {ai.key ? (
-            <div className="flex flex-wrap items-center gap-2">
-              <code className="rounded bg-white px-2 py-1 text-stone-700">{ai.key.slice(0, 10)}…{ai.key.slice(-4)}</code>
-              <button className={btn.ghost + ' !text-xs hover:!text-red-600'} onClick={() => setAi({ key: '', enabled: hosted.enabled })}><Icon name="Trash2" className="h-3.5 w-3.5" />Remove key</button>
-            </div>
-          ) : (
-            <div className="flex gap-2">
-              <input type="password" autoComplete="off" className={inputCls} placeholder="sk-ant-…" value={draft} onChange={(e) => setDraft(e.target.value.trim())} />
-              <button className={btn.primary + ' !py-1.5'} disabled={!draft} onClick={() => { setAi({ key: draft, enabled: true }); setDraft(''); setOpen(false); }}>Save</button>
-            </div>
-          )}
-          <p className="text-stone-500">The key is saved only in this browser and is sent only to Anthropic, together with the files you import. Anyone using this browser profile could find it, so remove it on shared computers.</p>
+      <form onSubmit={submit} className="space-y-3">
+        <Field label="Email">
+          <input type="email" required autoComplete="email" autoFocus className={inputCls} value={email} onChange={(e) => setEmail(e.target.value)} placeholder="you@example.com" />
+        </Field>
+        <Field label="Password" hint={signup ? 'At least 6 characters.' : ''}>
+          <div className="relative">
+            <input type={show ? 'text' : 'password'} required minLength={6} autoComplete={signup ? 'new-password' : 'current-password'}
+              className={inputCls + ' pr-16'} value={password} onChange={(e) => setPassword(e.target.value)} />
+            <button type="button" onClick={() => setShow((v) => !v)} className="absolute right-2 top-1/2 -translate-y-1/2 rounded px-2 py-1 text-xs font-semibold text-stone-500 hover:bg-stone-100">{show ? 'Hide' : 'Show'}</button>
+          </div>
+        </Field>
+        {error && <p className="flex items-start gap-2 rounded-lg bg-red-50 px-3 py-2 text-sm text-red-700"><Icon name="AlertTriangle" className="mt-0.5 h-4 w-4 shrink-0" />{error}</p>}
+        <button type="submit" className={btn.primary + ' w-full'} disabled={busy}>
+          {busy && <Icon name="Loader2" className="h-4 w-4 animate-spin" />}{signup ? 'Create account' : 'Sign in'}
+        </button>
+      </form>
+    </Modal>
+  );
+}
+
+function AccountMenu({ me, onSignIn, onEvents, onNew, onSignOut }) {
+  const [open, setOpen] = useState(false);
+  if (!me.accounts) return null;
+  if (!me.user) return <button className={btn.secondary} onClick={onSignIn}><Icon name="Users" />Sign in</button>;
+  const act = (fn) => () => { setOpen(false); fn(); };
+  return (
+    <div className="relative">
+      <button className={btn.secondary + ' !pl-1.5'} onClick={() => setOpen((o) => !o)} aria-expanded={open} aria-label="Account menu">
+        <span className="grid h-7 w-7 place-items-center rounded-full bg-orange-600 text-xs font-bold text-white">{me.user.email[0].toUpperCase()}</span>
+        <span className="hidden max-w-[160px] truncate md:inline">{me.user.email}</span>
+        <Icon name="ChevronDown" className="h-4 w-4 text-stone-400" />
+      </button>
+      {open && <>
+        <div className="fixed inset-0 z-40" onClick={() => setOpen(false)} />
+        <div className="absolute right-0 z-50 mt-2 w-60 rounded-xl border border-stone-200 bg-white p-2 shadow-lg">
+          <div className="truncate px-2 py-1.5 text-sm font-semibold">{me.user.email}</div>
+          <div className="my-1 border-t border-stone-100" />
+          <button className={btn.ghost + ' w-full !justify-start'} onClick={act(onEvents)}><Icon name="CalendarClock" />My events</button>
+          <button className={btn.ghost + ' w-full !justify-start'} onClick={act(onNew)}><Icon name="Plus" />Start a new event</button>
+          <button className={btn.ghost + ' w-full !justify-start'} onClick={act(onSignOut)}><Icon name="ChevronLeft" />Sign out</button>
         </div>
-      )}
+      </>}
     </div>
   );
 }
 
-function ImportPanel({ onImport, busy, progress, ai, setAi, hosted }) {
+function SaveEventModal({ current, suggestedName, recipeCount, hasPlan, onSave, onClose }) {
+  const [name, setName] = useState(current?.name || suggestedName);
+  const [busy, setBusy] = useState(false);
+  const save = async (asNew) => { setBusy(true); const ok = await onSave(name.trim(), asNew); if (!ok) setBusy(false); };
+  return (
+    <Modal title={current ? 'Save event' : 'Save this event'} icon="CalendarClock" onClose={onClose}
+      footer={<>
+        <button className={btn.secondary} onClick={onClose}>Cancel</button>
+        {current && <button className={btn.secondary} disabled={busy || !name.trim()} onClick={() => save(true)}>Save as new event</button>}
+        <button className={btn.primary} disabled={busy || !name.trim()} onClick={() => save(false)}>
+          {busy && <Icon name="Loader2" className="h-4 w-4 animate-spin" />}{current ? 'Save changes' : 'Save event'}
+        </button>
+      </>}>
+      <form onSubmit={(e) => { e.preventDefault(); if (name.trim()) save(false); }}>
+        <Field label="Event name">
+          <input className={inputCls} autoFocus maxLength={80} value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. Thanksgiving 2026" />
+        </Field>
+      </form>
+      <p className="mt-3 text-sm text-stone-600">Saves your {recipeCount} recipe{recipeCount === 1 ? '' : 's'}, kitchen setup, schedule settings{hasPlan ? ', master plan and checklist progress' : ''} to your account, so you can open it on any device.</p>
+    </Modal>
+  );
+}
+
+function EventsModal({ current, onOpen, onNew, onClose, toast }) {
+  const [events, setEvents] = useState(null);
+  const [busyId, setBusyId] = useState(null);
+  useEffect(() => {
+    api('/api/events').then((d) => setEvents(d.events)).catch((e) => { toast(e.message, 'error'); setEvents([]); });
+  }, []);
+  const remove = async (ev) => {
+    if (!confirm(`Delete “${ev.name}”? This can't be undone.`)) return;
+    setBusyId(ev.id);
+    try { await api(`/api/events?id=${ev.id}`, { method: 'DELETE' }); setEvents((list) => list.filter((x) => x.id !== ev.id)); toast(`Deleted “${ev.name}”`); }
+    catch (e) { toast(e.message, 'error'); }
+    setBusyId(null);
+  };
+  const open = async (ev) => { setBusyId(ev.id); if (!(await onOpen(ev))) setBusyId(null); };
+  const fmt = (iso) => { const d = new Date(iso); return isNaN(d) ? '' : d.toLocaleDateString([], { month: 'short', day: 'numeric', year: 'numeric' }); };
+  return (
+    <Modal title="My events" icon="CalendarClock" onClose={onClose} wide
+      footer={<><button className={btn.secondary} onClick={onNew}><Icon name="Plus" />Start a new event</button><button className={btn.primary} onClick={onClose}>Done</button></>}>
+      {events === null ? (
+        <div className="flex items-center justify-center gap-2 py-10 text-sm text-stone-500"><Icon name="Loader2" className="h-4 w-4 animate-spin" />Loading your events…</div>
+      ) : events.length === 0 ? (
+        <div className="py-10 text-center">
+          <Icon name="CalendarClock" className="mx-auto h-10 w-10 text-stone-300" />
+          <p className="mt-3 font-semibold text-stone-600">No saved events yet</p>
+          <p className="mt-1 text-sm text-stone-500">Add recipes, build a plan, then click <b>Save</b> at the top of the page.</p>
+        </div>
+      ) : (
+        <ul className="divide-y divide-stone-100 rounded-xl border border-stone-200">
+          {events.map((ev) => (
+            <li key={ev.id} className={`flex flex-wrap items-center gap-3 px-4 py-3 ${current?.id === ev.id ? 'bg-orange-50' : ''}`}>
+              <div className="min-w-0 flex-1">
+                <div className="flex items-center gap-2 font-semibold">
+                  <span className="truncate">{ev.name}</span>
+                  {current?.id === ev.id && <span className="rounded-full bg-orange-100 px-2 py-0.5 text-[11px] font-bold text-orange-700">open now</span>}
+                </div>
+                <div className="mt-0.5 text-xs text-stone-500">
+                  {ev.when && <>{fmt(ev.when)} · </>}{ev.recipeCount} recipe{ev.recipeCount === 1 ? '' : 's'}{ev.hasPlan ? ' · plan built' : ''} · saved {fmt(ev.updatedAt)}
+                </div>
+              </div>
+              <div className="flex gap-1">
+                <button className={btn.secondary + ' !py-1.5'} disabled={busyId === ev.id} onClick={() => open(ev)}>{busyId === ev.id ? <Icon name="Loader2" className="h-4 w-4 animate-spin" /> : 'Open'}</button>
+                <button className={btn.ghost + ' hover:!text-red-600'} disabled={busyId === ev.id} onClick={() => remove(ev)} aria-label={`Delete ${ev.name}`}><Icon name="Trash2" /></button>
+              </div>
+            </li>
+          ))}
+        </ul>
+      )}
+    </Modal>
+  );
+}
+
+function ImportPanel({ onImport, busy, progress }) {
   const [drag, setDrag] = useState(false);
   const [paste, setPaste] = useState('');
   const [showPaste, setShowPaste] = useState(false);
@@ -1451,7 +1403,6 @@ function ImportPanel({ onImport, busy, progress, ai, setAi, hosted }) {
     <Card className="p-5">
       <h3 className="flex items-center gap-2 font-semibold"><Icon name="Upload" className="h-4 w-4 text-orange-600" />Import recipes</h3>
       <p className="mt-1 text-sm text-stone-500">Photos or scans, PDFs, text/Markdown, saved recipe web pages (.html) or JSON.</p>
-      <AISettings ai={ai} setAi={setAi} hosted={hosted} />
       <div
         className={`mt-4 flex cursor-pointer flex-col items-center justify-center rounded-2xl border-2 border-dashed px-4 py-8 text-center transition ${drag ? 'border-orange-500 bg-orange-50' : 'border-stone-300 hover:border-orange-400 hover:bg-orange-50/40'}`}
         onClick={() => !busy && fileRef.current?.click()}
@@ -1636,7 +1587,7 @@ function RecipeEditor({ recipe, onSave, onClose }) {
   );
 }
 
-function RecipesStep({ recipes, setRecipes, onEdit, onImport, busy, progress, onLoadSample, ai, setAi, hosted }) {
+function RecipesStep({ recipes, setRecipes, onEdit, onImport, busy, progress, onLoadSample }) {
   const exportJSON = () => download('kitchen-sync-recipes.json', new Blob([JSON.stringify(recipes.map(({ _review, ...r }) => r), null, 2)], { type: 'application/json' }));
   return (
     <div className="space-y-6">
@@ -1646,7 +1597,7 @@ function RecipesStep({ recipes, setRecipes, onEdit, onImport, busy, progress, on
       </div>
       <div className="grid gap-6 lg:grid-cols-5">
         <div className="space-y-6 lg:col-span-2">
-          <ImportPanel onImport={onImport} busy={busy} progress={progress} ai={ai} setAi={setAi} hosted={hosted} />
+          <ImportPanel onImport={onImport} busy={busy} progress={progress} />
           <SampleSets onLoad={onLoadSample} />
         </div>
         <div className="lg:col-span-3">
@@ -2116,11 +2067,76 @@ function App() {
   const [busy, setBusy] = useState(false);
   const [progress, setProgress] = useState('');
   const [toasts, setToasts] = useState([]);
-  const [ai, setAi] = useState(() => store.get('ks.ai', { key: '', enabled: true }));
-  const [hosted, setHosted] = useState({ enabled: false });
+  const [me, setMe] = useState(SIGNED_OUT);
+  const [dialog, setDialog] = useState(null);   // null | { type: 'auth', mode, then } | { type: 'save' } | { type: 'events' }
+  const [currentEvent, setCurrentEvent] = useState(() => store.get('ks.event', null));   // { id, name } of the open saved event
+  const [savedKey, setSavedKey] = useState(() => store.get('ks.savedKey', ''));
+  const [suggestedName, setSuggestedName] = useState('');
 
-  useEffect(() => store.set('ks.ai', ai), [ai]);
-  useEffect(() => { fetchAIStatus().then(setHosted); }, []);
+  useEffect(() => { store.set('ks.event', currentEvent); store.set('ks.savedKey', savedKey); }, [currentEvent, savedKey]);
+  const refreshMe = async () => { const m = await fetchMe(); setMe(m); return m; };
+  useEffect(() => { refreshMe(); }, []);
+
+  const workKey = JSON.stringify({ r: recipes.map(({ _review, ...r }) => r), s: settings, c: checked, p: planKey });
+  const unsaved = currentEvent ? workKey !== savedKey : recipes.length > 0;
+
+  const afterAuth = async (user, isNew, then) => {
+    setDialog(null);
+    await refreshMe();
+    toast(isNew ? `Welcome, ${user.email}!` : `Signed in as ${user.email}`);
+    if (then) setDialog({ type: then });
+  };
+  const requireSignIn = (then) => (me.user ? setDialog({ type: then }) : setDialog({ type: 'auth', mode: 'signin', then }));
+
+  const saveEvent = async (name, asNew) => {
+    try {
+      const { event } = await api('/api/events', { method: 'POST', body: {
+        id: asNew ? undefined : currentEvent?.id, name,
+        recipes: recipes.map(({ _review, ...r }) => r), settings, plan, planKey, checked,
+      } });
+      setCurrentEvent({ id: event.id, name: event.name });
+      setSavedKey(workKey);
+      setDialog(null);
+      toast(`Saved “${event.name}”`);
+      return true;
+    } catch (e) {
+      if (e.status === 401) { await refreshMe(); setDialog({ type: 'auth', mode: 'signin', then: 'save' }); }
+      toast(e.message, 'error');
+      return false;
+    }
+  };
+  const confirmDiscard = () => !unsaved || confirm('Your current work has unsaved changes. Replace it anyway?');
+  const openEvent = async (summary) => {
+    if (!confirmDiscard()) return false;
+    try {
+      const { event } = await api(`/api/events?id=${summary.id}`);
+      const rs = (event.recipes || []).map(normalizeRecipe);
+      const st = { ...defaultSettings(), ...event.settings };
+      const ck = event.checked || {};
+      const pk = event.planKey || '';
+      setRecipes(rs); setSettings(st); setPlan(event.plan || null); setPlanKey(pk); setChecked(ck);
+      setCurrentEvent({ id: event.id, name: event.name });
+      setSavedKey(JSON.stringify({ r: rs, s: st, c: ck, p: pk }));
+      setStep(event.plan ? 3 : 1);
+      setDialog(null);
+      toast(`Opened “${event.name}”`);
+      return true;
+    } catch (e) { toast(e.message, 'error'); return false; }
+  };
+  const newEvent = () => {
+    if (!confirmDiscard()) return;
+    setRecipes([]); setPlan(null); setPlanKey(''); setChecked({}); setDismissed([]);
+    setSettings((s) => ({ ...s, time: defaultSettings().time }));
+    setCurrentEvent(null); setSavedKey(''); setSuggestedName('');
+    setStep(1); setDialog(null);
+    toast('Started a new event');
+  };
+  const signOut = async () => {
+    try { await api('/api/auth?action=signout', { method: 'POST' }); } catch {}
+    setCurrentEvent(null); setSavedKey('');
+    await refreshMe();
+    toast('Signed out – your current work stays on this device');
+  };
   useEffect(() => store.set('ks.recipes', recipes), [recipes]);
   useEffect(() => store.set('ks.settings', settings), [settings]);
   useEffect(() => store.set('ks.checked', checked), [checked]);
@@ -2183,41 +2199,21 @@ function App() {
 
   const onImport = async (files, pasted) => {
     setBusy(true);
-    const added = [], failed = [], aiProblems = [];
-    let useAI = ai.enabled && (!!ai.key || (hosted.enabled && hosted.remaining > 0)), aiCount = 0;
-    // Try Claude first; fall back to the basic reader if AI is off or the request fails.
-    const read = async (label, viaAI, viaBasic) => {
-      if (useAI) {
-        try {
-          setProgress(`Claude is reading ${label}…`);
-          const { recipes: rs, remaining } = await viaAI();
-          if (remaining != null) setHosted((h) => ({ ...h, remaining }));
-          aiCount += rs.length;
-          return rs;
-        } catch (e) {
-          console.error(e);
-          aiProblems.push(e.message);
-          if (e.remaining != null) setHosted((h) => ({ ...h, remaining: e.remaining }));
-          if (e.fatal) useAI = false;
-        }
-      }
-      return viaBasic();
-    };
+    const added = [], failed = [];
     try {
-      if (pasted) added.push(...await read('your pasted text', () => aiReadText(pasted, ai.key), async () => splitAndParse(pasted, 'Pasted recipe')));
+      if (pasted) added.push(...splitAndParse(pasted, 'Pasted recipe'));
       for (const f of files || []) {
         try {
-          const rs = await read(f.name, () => aiReadFile(f, ai.key), () => importFile(f, setProgress));
+          const rs = await importFile(f, setProgress);
           if (!rs.length) failed.push(f.name);
           added.push(...rs);
         } catch (e) { console.error(e); failed.push(f.name); }
       }
     } finally { setBusy(false); setProgress(''); }
-    if (aiProblems.length) toast(`AI reading problem – used the basic reader instead. ${[...new Set(aiProblems)][0]}`, 'error');
     if (failed.length) toast(`No recipe found in: ${failed.join(', ')}`, 'error');
     if (!added.length) return;
     setRecipes((rs) => [...rs, ...added]);
-    toast(`Imported ${added.length} recipe${added.length > 1 ? 's' : ''}${aiCount ? ` (${aiCount} read by Claude)` : ''}`);
+    toast(`Imported ${added.length} recipe${added.length > 1 ? 's' : ''}`);
     const qs = reviewQuestions(added);
     if (qs.length) setClarify({ mode: 'import', questions: qs });
   };
@@ -2230,6 +2226,7 @@ function App() {
       d.setHours(set.anchor.h, set.anchor.m, 0, 0);
       setSettings((s) => ({ ...s, anchor: set.anchor.mode, time: toLocalInput(d) }));
       setDismissed([]);
+      setSuggestedName(set.name);
       toast(`Loaded “${set.name}” – ${set.anchor.mode === 'target' ? 'ready by' : 'starting at'} ${fmtClock(d)}`);
     } else toast(`Added ${fresh.length} recipes`);
   };
@@ -2257,9 +2254,17 @@ function App() {
             <div className="grid h-10 w-10 place-items-center rounded-xl bg-gradient-to-br from-orange-500 to-red-600 text-white shadow"><Icon name="ChefHat" className="h-5 w-5" /></div>
             <div className="mr-auto">
               <div className="text-lg font-extrabold leading-tight tracking-tight">Kitchen Sync</div>
-              <div className="hidden text-xs text-stone-500 sm:block">Multi-recipe cooking & baking planner</div>
+              <div className="hidden text-xs text-stone-500 sm:block">{currentEvent ? <>Event: <b className="text-stone-700">{currentEvent.name}</b>{unsaved ? ' · unsaved changes' : ' · saved'}</> : 'Multi-recipe cooking & baking planner'}</div>
             </div>
             {plan && step !== 3 && <button className={btn.secondary + ' hidden sm:inline-flex'} onClick={() => setStep(3)}><Icon name="ListChecks" />View plan</button>}
+            {me.accounts && (
+              <button className={btn.secondary + ' relative'} onClick={() => requireSignIn('save')} title={currentEvent ? `Save “${currentEvent.name}”` : 'Save this event to your account'}>
+                <Icon name="Save" /><span className="hidden sm:inline">{currentEvent ? 'Save' : 'Save event'}</span>
+                {currentEvent && unsaved && <span className="absolute -right-1 -top-1 h-3 w-3 rounded-full border-2 border-white bg-orange-500" aria-label="Unsaved changes" />}
+              </button>
+            )}
+            <AccountMenu me={me} onSignIn={() => setDialog({ type: 'auth', mode: 'signin' })} onEvents={() => setDialog({ type: 'events' })}
+              onNew={newEvent} onSignOut={signOut} />
           </div>
           <nav className="mx-auto max-w-7xl px-4 pb-3" aria-label="Steps">
             <ol className="flex items-center gap-1 sm:gap-2">
@@ -2279,7 +2284,7 @@ function App() {
 
         <main className="mx-auto max-w-7xl px-4 py-6 sm:py-8">
           {step === 0 && <KitchenStep settings={settings} setSettings={setSettings} recipes={recipes} />}
-          {step === 1 && <RecipesStep recipes={recipes} setRecipes={setRecipes} onEdit={setEditing} onImport={onImport} busy={busy} progress={progress} onLoadSample={onLoadSample} ai={ai} setAi={setAi} hosted={hosted} />}
+          {step === 1 && <RecipesStep recipes={recipes} setRecipes={setRecipes} onEdit={setEditing} onImport={onImport} busy={busy} progress={progress} onLoadSample={onLoadSample} />}
           {step === 2 && <ScheduleStep settings={settings} setSettings={setSettings} recipes={recipes} onGenerate={requestBuild} />}
           {step === 3 && <PlanStep plan={plan} stale={stale} onRebuild={requestBuild} checked={checked} setChecked={setChecked} onAction={onAction} toast={toast} />}
 
@@ -2299,13 +2304,18 @@ function App() {
           )}
         </main>
         <footer className="mx-auto max-w-7xl px-4 pb-10 text-xs text-stone-400">
-          Oven model: preheat ≈20°F/min, cool-down ≈8°F/min with the door cracked; temperature nudges add ~10% time per 25°F. Your data stays in this browser.
+          Oven model: preheat ≈20°F/min, cool-down ≈8°F/min with the door cracked; temperature nudges add ~10% time per 25°F. Your work is kept in this browser; sign in to save events to your account.
         </footer>
       </div>
 
       <PrintView plan={plan} checked={checked} />
 
       {editing && <RecipeEditor recipe={editing} onSave={saveRecipe} onClose={() => setEditing(null)} />}
+      {dialog?.type === 'auth' && <AuthModal initialMode={dialog.mode} onClose={() => setDialog(null)} onDone={(user, isNew) => afterAuth(user, isNew, dialog.then)} />}
+      {dialog?.type === 'save' && <SaveEventModal current={currentEvent} recipeCount={recipes.length} hasPlan={!!plan}
+        suggestedName={suggestedName || `My event – ${(fromLocalInput(settings.time) || new Date()).toLocaleDateString([], { month: 'short', day: 'numeric' })}`}
+        onSave={saveEvent} onClose={() => setDialog(null)} />}
+      {dialog?.type === 'events' && <EventsModal current={currentEvent} onOpen={openEvent} onNew={newEvent} onClose={() => setDialog(null)} toast={toast} />}
       {clarify && <ClarifyModal key={clarify.questions.map((q) => q.key).join()} data={clarify} onApply={applyAnswers} onClose={() => setClarify(null)} />}
 
       <div className="pointer-events-none fixed bottom-4 left-1/2 z-[60] flex w-[calc(100%-2rem)] max-w-sm -translate-x-1/2 flex-col gap-2 print:hidden">
